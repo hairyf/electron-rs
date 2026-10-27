@@ -1,0 +1,19 @@
+{
+  "name": "electron-rs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc -p tsconfig.electron.json",
+    "test": "pnpm run test:checks && cargo test --locked",
+    "test:checks": "node tests/checks/transport.mjs && node tests/checks/startup.mjs && node tests/checks/commands.mjs",
+    "test:bridge:prepare": "cargo test --locked --test bridge prepare_bridge -- --ignored --exact --test-threads=1 --nocapture",
+    "test:bridge": "cargo test --locked --test bridge real_bridge -- --ignored --exact --test-threads=1 --nocapture"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "electron": "45.0.0",
+    "tsdown": "^0.23.2",
+    "typescript": "5.9.3"
+  }
+}

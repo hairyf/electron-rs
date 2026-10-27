@@ -1,0 +1,88 @@
+//! cargo run --manifest-path example/Cargo.toml --bin streaming
+//! Run acquisition first. Real Electron requires a desktop/display (e.g. Xvfb on Linux).
+
+use std::{path::Path, time::Duration};
+
+use electron_rs::{arch, platform, CommandChunk, Electron, ElectronBuilder, DEFAULT_VERSION};
+
+fn show_output(chunk: CommandChunk) {
+  // These scripts emit text; chunk.data itself preserves the original raw bytes.
+  eprint!(
+    "[{:?} #{}] {}",
+    chunk.stream,
+    chunk.sequence,
+    String::from_utf8_lossy(&chunk.data)
+  );
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+  let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("target/electron")
+    .join(format!("{}-{}", platform(), arch()));
+  let binary = ElectronBuilder::new(DEFAULT_VERSION)
+    .output(directory)
+    .binary()?;
+  let electron = Electron::new(binary, 0).await?;
+
+  let (worker, main) = tokio::join!(
+    async {
+      electron
+        .node_in_main(
+          r#"
+        const { isMainThread, threadId } = require('node:worker_threads');
+        const { setTimeout: delay } = require('node:timers/promises');
+        for (let step = 1; step <= 3; step++) {
+          console.log(`worker ${args[0]}: ${step}/3`);
+          await delay(250, undefined, { signal });
+        }
+        console.error('worker stderr');
+        return { pid: process.pid, isMainThread, threadId };
+      "#,
+          &["job"],
+        )
+        .timeout(Duration::from_secs(10))
+        .max_output_bytes(4096)
+        .on_output(show_output)
+        .await
+    },
+    async {
+      // Keep main-thread scripts asynchronous: synchronous CPU work blocks Electron.
+      electron
+        .electron_in_main(
+          r#"
+        const { app } = require('electron');
+        const { isMainThread, threadId } = require('node:worker_threads');
+        for (let step = 1; step <= 3; step++) {
+          console.log(`main ${args[0]}: ${step}/3`);
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+        console.error('main stderr');
+        return { pid: process.pid, isMainThread, threadId, ready: app.isReady() };
+      "#,
+          &["job"],
+        )
+        .timeout(Duration::from_secs(10))
+        .max_output_bytes(4096)
+        .on_output(show_output)
+        .await
+    },
+  );
+  let worker = worker?;
+  let main = main?;
+  assert!(worker.success(), "worker: {worker:?}");
+  assert!(main.success(), "main: {main:?}");
+  assert_eq!(worker.result["isMainThread"], false);
+  assert_eq!(main.result["isMainThread"], true);
+  assert_eq!(main.result["ready"], true);
+  assert_eq!(worker.result["pid"], main.result["pid"]);
+  println!("worker result: {}", worker.result);
+  println!("main result: {}", main.result);
+  println!(
+    "captured worker/main stdout: {}/{} bytes",
+    worker.stdout.len(),
+    main.stdout.len()
+  );
+  electron.shutdown();
+  Ok(())
+}

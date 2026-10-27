@@ -55,7 +55,7 @@ const PAGE: &str = r#"<!doctype html><html><head>
 </script></body></html>"#;
 
 fn repository() -> &'static Path {
-  Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+  Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
 fn stage_root() -> PathBuf {
