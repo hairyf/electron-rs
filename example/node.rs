@@ -1,4 +1,4 @@
-//! cargo run --manifest-path example/Cargo.toml --bin node
+//! cargo run --manifest-path example/Cargo.toml --bin node-command
 //! Run acquisition first. Node mode needs no display and starts no RPC bridge.
 
 use std::{

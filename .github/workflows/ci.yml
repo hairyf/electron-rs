@@ -113,7 +113,7 @@ jobs:
       - name: Run the standalone examples
         if: runner.os != 'Linux'
         run: |
-          cargo run --locked --manifest-path example/Cargo.toml --bin node
+          cargo run --locked --manifest-path example/Cargo.toml --bin node-command
           cargo run --locked --manifest-path example/Cargo.toml --bin rpc
           cargo run --locked --manifest-path example/Cargo.toml --bin streaming
 
@@ -122,6 +122,6 @@ jobs:
         run: >
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24'
           sh -c 'openbox & sleep 1;
-          cargo run --locked --manifest-path example/Cargo.toml --bin node &&
+          cargo run --locked --manifest-path example/Cargo.toml --bin node-command &&
           cargo run --locked --manifest-path example/Cargo.toml --bin rpc &&
           cargo run --locked --manifest-path example/Cargo.toml --bin streaming'

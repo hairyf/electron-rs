@@ -104,7 +104,7 @@ Run these from the repository root. Acquisition prepares the distribution used b
 
 ```bash
 cargo run --manifest-path example/Cargo.toml --bin acquisition
-cargo run --manifest-path example/Cargo.toml --bin node
+cargo run --manifest-path example/Cargo.toml --bin node-command
 cargo run --manifest-path example/Cargo.toml --bin rpc
 cargo run --manifest-path example/Cargo.toml --bin streaming
 ```

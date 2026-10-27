@@ -15,7 +15,7 @@ name = "acquisition"
 path = "acquisition.rs"
 
 [[bin]]
-name = "node"
+name = "node-command"
 path = "node.rs"
 
 [[bin]]
