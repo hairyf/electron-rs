@@ -67,12 +67,17 @@ export class IPC extends EventEmitter<IPCEvents> {
   private nextRequest = 0
   private _closed = false
 
-  constructor(port: number) {
+  constructor(port: number, readiness?: Promise<unknown>) {
     super()
     const { port1, port2 } = new MessageChannel()
     this.channel = port1
-    const signal = new SharedArrayBuffer(8)
+    const signal = new SharedArrayBuffer(12)
     this.state = new Int32Array(signal)
+    if (readiness) readiness.then(() => {
+      Atomics.store(this.state, 2, 1)
+      Atomics.notify(this.state, 2)
+    }, () => this.close())
+    else Atomics.store(this.state, 2, 1)
 
     this.worker = new Worker(__filename, {
       workerData: { port, channel: port2, signal } satisfies IPCWorkerData,
@@ -146,6 +151,8 @@ export class IPC extends EventEmitter<IPCEvents> {
     Atomics.store(this.state, 1, 1)
     Atomics.add(this.state, 0, 1)
     Atomics.notify(this.state, 0)
+    Atomics.store(this.state, 2, 1)
+    Atomics.notify(this.state, 2)
     this.channel.close()
     this.worker.terminate().catch(noop)
     this.emit('close')
@@ -196,6 +203,10 @@ function thread(): void {
     Atomics.add(state, 0, 1)
     Atomics.notify(state, 0)
   })
+
+  // Rust bounds unauthenticated peers to 500 ms; connect only when ready to authenticate.
+  while (Atomics.load(state, 2) === 0 && Atomics.load(state, 1) === 0) Atomics.wait(state, 2, 0)
+  if (Atomics.load(state, 1) !== 0) { channel.close(); return }
 
   const socket = net.connect(port, '127.0.0.1')
   socket.setEncoding('utf8')

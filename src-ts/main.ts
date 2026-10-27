@@ -70,7 +70,13 @@ const popups = new Map<number, PopupPlan>()
 
 // ── 基础设施 ───────────────────────────────────────────────────────────────
 // IPC 只是字节通道：Worker（同文件自举）+ socket，与业务无关。
-const ipc = new IPC(port)
+const ready = app.whenReady().then(() => {
+  if (identifier) app.setAppUserModelId(identifier)
+  // Tauri 应用自绘窗口装饰；Electron 默认菜单只会造成干扰。
+  Menu.setApplicationMenu(null)
+  policies.install(session.defaultSession)
+})
+const ipc = new IPC(port, ready)
 
 // transport 才负责「请求 → 查表 → 回包」，是唯一能被替身替换的接缝。
 const transport = new Transport(ipc)
@@ -145,13 +151,6 @@ downloads.on('finished', (payload) => transport.send('download.finished', payloa
 
 // ── 生命周期 ───────────────────────────────────────────────────────────────
 // 每一条都对应一个所有权判断，所以集中在这里。
-const ready = app.whenReady().then(() => {
-  if (identifier) app.setAppUserModelId(identifier)
-  // Tauri 应用自绘窗口装饰；Electron 默认菜单只会造成干扰。
-  Menu.setApplicationMenu(null)
-  policies.install(session.defaultSession)
-})
-
 // 握手后 Rust 即可调用原生 API，必须先完成 Electron 初始化。
 transport.onConnect(async () => {
   await ready

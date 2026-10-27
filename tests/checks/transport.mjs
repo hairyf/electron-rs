@@ -6,6 +6,7 @@ import { Worker, isMainThread, parentPort } from 'node:worker_threads'
 
 if (!isMainThread) {
   const server = net.createServer((socket) => {
+    parentPort.postMessage({ accepted: true })
     socket.setEncoding('utf8')
     const send = (id, method, params) => socket.write(JSON.stringify({ id, method, params }) + '\n')
     let buffer = '', queued, cached = false, rpc = 200
@@ -118,10 +119,15 @@ if (!isMainThread) {
         transport.send({ id: message.id, error: error.message })
       }
     }
-    transport = new IPC(port)
+    let resolveReady
+    const readiness = new Promise((resolve) => { resolveReady = resolve })
+    transport = new IPC(port, readiness)
     transport.on('request', onRequest)
     transport.on('connect', () => transport.send({ event: 'ready', params: { token: 'handshake' } }))
     transport.on('close', () => { closes++ })
+    await new Promise((resolve) => setTimeout(resolve, 650))
+    assert.equal(received.some((message) => message.accepted), false, 'TCP must not connect before app readiness, even beyond the 500 ms authentication deadline')
+    resolveReady()
     await until(() => received.some((message) => message.async))
     assert.deepEqual(received.find((message) => message.ready).ready, { token: 'handshake' })
     assert.deepEqual(received.find((message) => message.async).async.result, { value: '窗口' })
