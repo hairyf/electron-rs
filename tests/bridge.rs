@@ -334,26 +334,26 @@ fn prepare_bridge() {
     fs::read(directory.join("electron-rs.json")).unwrap(),
     marker
   );
-  let output = builder.node(&["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,platform:process.platform,arch:process.arch,answer:6*7}))"])
-    .expect("run the staged real binary in Node mode");
+  let output = block_on(async { builder.node(&["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,platform:process.platform,arch:process.arch,answer:6*7}))"])
+    .expect("run the staged real binary in Node mode").wait_with_output().await.unwrap() });
   assert!(output.status.success(), "{:?}", output);
   let result: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert_eq!(
     result,
     json!({"electron":DEFAULT_VERSION,"platform":platform(),"arch":arch(),"answer":42})
   );
-  let failed = builder
+  let failed = block_on(async { builder
     .node(&[
       "-e",
       "process.stderr.write('bridge-node-error');process.exit(23)",
     ])
-    .expect("collect nonzero Node output");
+    .expect("collect nonzero Node output").wait_with_output().await.unwrap() });
   assert_eq!(failed.status.code(), Some(23));
   assert!(failed.stdout.is_empty());
   assert_eq!(failed.stderr, b"bridge-node-error");
-  let silent = builder
+  let silent = block_on(async { builder
     .node(&["-e", "process.exit(17)"])
-    .expect("collect silent Node failure");
+    .expect("collect silent Node failure").wait_with_output().await.unwrap() });
   assert_eq!(silent.status.code(), Some(17));
   assert!(silent.stdout.is_empty() && silent.stderr.is_empty());
   assert_eq!(
@@ -399,7 +399,7 @@ fn event_matching(
 // Keep the real-desktop assertions synchronous, as in ipc.rs's transport tests.
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
   tokio::runtime::Builder::new_current_thread()
-    .enable_time()
+    .enable_all()
     .build()
     .unwrap()
     .block_on(future)
@@ -410,14 +410,13 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
   use electron_rs::OutputStream;
 
   let general = electron.subscribe();
-  let oracle = electron_rs::node(binary, &["-e", "process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));"])
-    .expect("direct connected Node binary-output oracle");
+  let oracle = block_on(async { electron_rs::node(binary, &["-e", "process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));"])
+    .expect("direct connected Node binary-output oracle").wait_with_output().await.unwrap() });
   assert!(oracle.status.success(), "{oracle:?}");
   block_on(async {
     // Node forwards native CLI args to another PID; run keeps the existing main.
     let identity = "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,electron:process.versions.electron,nodeMode:process.env.ELECTRON_RUN_AS_NODE}));";
-    let node_client = Arc::clone(electron);
-    let node = tokio::task::spawn_blocking(move || node_client.node(&["-e", identity])).await.unwrap().unwrap();
+    let node = electron.node(&["-e", identity]).unwrap().wait_with_output().await.unwrap();
     assert!(node.status.success(), "{node:?}");
     let node: Value = serde_json::from_slice(&node.stdout).unwrap();
     assert_eq!(node["isMainThread"], true);
@@ -439,7 +438,7 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     let version = electron_rs::electron(binary, &["--version"]).unwrap();
     assert!(version.status.success(), "{version:?}");
     assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), format!("v{DEFAULT_VERSION}"));
-    let printed = electron.node(&["-p", "6 * 7"]).unwrap();
+    let printed = electron.node(&["-p", "6 * 7"]).unwrap().wait_with_output().await.unwrap();
     assert!(printed.status.success(), "{printed:?}");
     assert_eq!(printed.stdout, b"42\n");
     // Deliberately omit .timeout() and exceed normal RPC's 5s deadline.
@@ -449,7 +448,7 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"unlimited");
     assert!(output.stderr.is_empty());
-    let node = electron.node(&["-e", "if(process.argv[1]!=='argument with spaces'||process.argv[2]!=='雪 🦀')throw new Error('arguments changed');process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));", "--", "argument with spaces", "雪 🦀"]).unwrap();
+    let node = electron.node(&["-e", "if(process.argv[1]!=='argument with spaces'||process.argv[2]!=='雪 🦀')throw new Error('arguments changed');process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));", "--", "argument with spaces", "雪 🦀"]).unwrap().wait_with_output().await.unwrap();
     assert!(node.status.success(), "{node:?}");
     assert_eq!(node.stdout, oracle.stdout);
     assert_eq!(node.stderr, oracle.stderr);
@@ -458,7 +457,7 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, oracle.stdout);
     assert_eq!(output.stderr, oracle.stderr);
-    let failed = electron.node(&["-e", "process.exit(17)"]).unwrap();
+    let failed = electron.node(&["-e", "process.exit(17)"]).unwrap().wait_with_output().await.unwrap();
     assert_eq!(failed.status.code(), Some(17));
     assert!(failed.stdout.is_empty() && failed.stderr.is_empty());
     let failed = electron.run("process.exitCode=23;return {scoped:true};")
@@ -651,16 +650,16 @@ fn real_bridge() {
     let _ = callback_tx.send(event);
   });
   real_commands(electron, &binary);
-  let output = electron_rs::node(&binary, &["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,answer:21*2,page:Buffer.from(process.argv[1]).toString('base64')}))", PAGE]).unwrap();
+  let output = block_on(async { electron_rs::node(&binary, &["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,answer:21*2,page:Buffer.from(process.argv[1]).toString('base64')}))", PAGE]).unwrap().wait_with_output().await.unwrap() });
   assert!(output.status.success(), "{:?}", output);
   let node: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert_eq!(node["electron"], DEFAULT_VERSION);
   assert_eq!(node["answer"], 42);
-  let failed = electron_rs::node(&binary, &[
+  let failed = block_on(async { electron_rs::node(&binary, &[
       "-e",
       "process.stderr.write('connected-node-error');process.exit(23)",
     ])
-    .expect("collect connected Node failure output");
+    .expect("collect connected Node failure output").wait_with_output().await.unwrap() });
   assert_eq!(failed.status.code(), Some(23));
   assert!(failed.stdout.is_empty());
   assert_eq!(failed.stderr, b"connected-node-error");

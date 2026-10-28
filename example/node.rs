@@ -8,7 +8,8 @@ use std::{
 
 use electron_rs::{electron_binary, node, DEFAULT_VERSION};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let output = node(electron_binary!(None::<&Path>)?, &[
     "-e",
     r#"
@@ -21,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }) + '\n');
     process.stderr.write('real Node stderr\n');
   "#,
-  ])?;
+  ])?.wait_with_output().await?;
   io::stdout().write_all(&output.stdout)?;
   io::stderr().write_all(&output.stderr)?;
   eprintln!("status: {}", output.status);

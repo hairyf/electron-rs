@@ -175,11 +175,10 @@ impl ElectronBuilder {
     acquisition::output_directory(self.output.as_deref(), &DistributionTarget::current()?)
   }
 
-  /// Run the prepared binary in Node mode without starting the RPC bridge.
-  /// Nonzero exits are `Ok(Output)`; inspect `status`, `stdout` and `stderr`.
-  pub fn node(&self, args: &[&str]) -> io::Result<Output> {
-    let binary = self.binary().map_err(io::Error::other)?;
-    node(&binary, args)
+  /// Spawn the prepared binary in Node mode without starting the RPC bridge.
+  /// Returns the native child with piped stdout/stderr; requires a Tokio I/O runtime.
+  pub fn node(&self, args: &[&str]) -> io::Result<tokio::process::Child> {
+    node(self.binary().map_err(io::Error::other)?, args)
   }
 
   /// Run the prepared binary in Electron mode without starting the RPC bridge.
@@ -237,16 +236,26 @@ macro_rules! electron_binary {
   }};
 }
 
-/// Run an Electron binary in Node mode, without starting the RPC bridge.
-/// Blocks until exit; nonzero exits return `Ok(Output)` with both output streams.
-pub fn node(binary: impl AsRef<Path>, args: &[&str]) -> io::Result<Output> {
-  run_command(binary.as_ref(), args, true)
+/// Spawn an Electron binary in Node mode without starting the RPC bridge.
+/// Returns the native Tokio child: read its stdout/stderr pipes live, wait for
+/// output, or kill it using Tokio's APIs. Stdin is closed; dropping a running
+/// child requests termination. Requires a Tokio runtime with I/O enabled.
+pub fn node(binary: impl AsRef<Path>, args: &[&str]) -> io::Result<tokio::process::Child> {
+  let mut command = tokio::process::Command::new(binary.as_ref());
+  command.args(args).env("ELECTRON_RUN_AS_NODE", "1")
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true);
+  #[cfg(windows)]
+  command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+  command.spawn()
 }
 
 /// Run an Electron binary normally, explicitly clearing `ELECTRON_RUN_AS_NODE`.
 /// Blocks until exit; nonzero exits return `Ok(Output)` with both output streams.
 pub fn electron(binary: impl AsRef<Path>, args: &[&str]) -> io::Result<Output> {
-  run_command(binary.as_ref(), args, false)
+  run_command(binary.as_ref(), args)
 }
 
 fn electron_binary_for(path: &Path, target: &DistributionTarget) -> Result<PathBuf, Error> {
@@ -346,14 +355,9 @@ fn compile_native_assets(dir: &Path, target: &DistributionTarget) -> Result<(), 
   Ok(())
 }
 
-fn run_command(binary: &Path, args: &[&str], node: bool) -> io::Result<Output> {
+fn run_command(binary: &Path, args: &[&str]) -> io::Result<Output> {
   let mut command = ProcessCommand::new(binary);
-  command.args(args);
-  if node {
-    command.env("ELECTRON_RUN_AS_NODE", "1");
-  } else {
-    command.env_remove("ELECTRON_RUN_AS_NODE");
-  }
+  command.args(args).env_remove("ELECTRON_RUN_AS_NODE");
   #[cfg(windows)]
   {
     use std::os::windows::process::CommandExt;
@@ -480,15 +484,15 @@ mod tests {
     }
   }
 
-  #[test]
-  fn node_preserves_process_status_and_both_output_streams() {
+  #[tokio::test]
+  async fn node_preserves_process_status_and_both_output_streams() {
     let binary = std::env::current_exe().unwrap();
-    let output = run_command(&binary, &["--exact", "tests::node_worker", "--nocapture"], true).unwrap();
+    let output = node(&binary, &["--exact", "tests::node_worker", "--nocapture"]).unwrap().wait_with_output().await.unwrap();
     assert_eq!(output.status.code(), Some(23));
     assert!(String::from_utf8_lossy(&output.stdout).contains("node stdout"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("node stderr"));
     let missing = acquisition::unique_sibling(&Path::new(env!("CARGO_MANIFEST_DIR")).join("target/missing-node"), "test");
-    assert_eq!(run_command(&missing, &[], true).unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert_eq!(node(&missing, &[]).unwrap_err().kind(), io::ErrorKind::NotFound);
   }
 
   #[test]
@@ -503,12 +507,12 @@ mod tests {
       assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
       return;
     }
-    let output = run_command(&binary, &["--exact", "tests::node_worker", "--nocapture"], false).unwrap();
+    let output = run_command(&binary, &["--exact", "tests::node_worker", "--nocapture"]).unwrap();
     assert_eq!(output.status.code(), Some(23));
     assert!(String::from_utf8_lossy(&output.stdout).contains("electron stdout"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("electron stderr"));
     assert_eq!(std::env::var_os("ELECTRON_RUN_AS_NODE").as_deref(), Some(std::ffi::OsStr::new("1")));
     let missing = acquisition::unique_sibling(&Path::new(env!("CARGO_MANIFEST_DIR")).join("target/missing-electron"), "test");
-    assert_eq!(run_command(&missing, &[], false).unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert_eq!(run_command(&missing, &[]).unwrap_err().kind(), io::ErrorKind::NotFound);
   }
 }

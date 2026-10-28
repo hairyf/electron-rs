@@ -14,10 +14,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let binary = electron_binary!(None::<&Path>)?;
   let client = Electron::new(binary, 0).await?;
   // Node is a real standalone Node-mode process, not a Worker or an RPC.
-  let node_client = client.clone();
-  let node = tokio::task::spawn_blocking(move || node_client.node(&[
+  let node = client.node(&[
     "-e", "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,nodeMode:process.env.ELECTRON_RUN_AS_NODE}));",
-  ]));
+  ])?;
   let main = client.run(r#"
     const { app } = require('electron');
     const { isMainThread, threadId } = require('node:worker_threads');
@@ -29,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     console.log(JSON.stringify({ pid: process.pid, isMainThread, threadId, ready: app.isReady() }));
     return 1n; // Ignored: only stdout/stderr are returned.
   "#).timeout(Duration::from_secs(10)).max_output_bytes(4096).on_output(show_output).await?;
-  let node = node.await??;
+  let node = node.wait_with_output().await?;
   assert!(node.status.success(), "node: {node:?}");
   assert!(main.status.success(), "main: {main:?}");
   let node_metadata: serde_json::Value = serde_json::from_slice(&node.stdout)?;
