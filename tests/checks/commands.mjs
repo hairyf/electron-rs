@@ -1,5 +1,6 @@
 // Run after the parent builds assets. The supervisor catches leaked workers and accidental host exits.
 import assert from 'node:assert/strict'
+import { createHook } from 'node:async_hooks'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
@@ -56,7 +57,7 @@ async function reference(script, args = []) {
       console.error(error && error.stack || String(error)); process.exitCode = 1;
     });
   `])
-  // CommandOutput.code is Rust i32, matching electron.node().status.code()
+  // The wire code is Rust i32, matching Output.status.code()
   // (std::process::ExitStatus), while Node exposes Windows exit DWORDs unsigned.
   return { ...result, code: process.platform === 'win32' ? (result.code | 0) : result.code }
 }
@@ -92,15 +93,14 @@ async function checks() {
   const start = (mode, script, overrides = {}) => {
     const taskId = `command-check-${++nextId}`
     const promise = deadline(Promise.resolve().then(() => service.execute({
-      taskId, mode, script, args: [], timeoutMs: 2_000, maxOutputBytes: 256 * 1024, stream: false, ...overrides,
+      taskId, mode, script, args: [], maxOutputBytes: 256 * 1024, stream: false, ...overrides,
     })), taskId).then(result => {
       completed.add(taskId)
-      assert.ok(result && typeof result === 'object', `${taskId}: result object`)
+      assert.ok(result && typeof result === 'object', `${taskId}: output object`)
+      assert.deepEqual(Object.keys(result).sort(), ['code', 'stderr', 'stdout'], `${taskId}: output-only wire contract`)
       assert.ok(Number.isInteger(result.code), `${taskId}: integer exit code`)
       bytes(result.stdout, `${taskId} stdout`)
       bytes(result.stderr, `${taskId} stderr`)
-      assert.ok(Object.hasOwn(result, 'result'), `${taskId}: JSON result field`)
-      assert.deepEqual(JSON.parse(JSON.stringify(result.result)), result.result, `${taskId}: JSON result`)
       return result
     })
     // Attach immediately: concurrent jobs may reject before their turn is awaited.
@@ -142,15 +142,65 @@ async function checks() {
       }
     }
 
+    // Observe timer allocation synchronously; the test safety deadline is installed afterward.
+    const shortTimeout = 25
+    for (const mode of ['node', 'electron']) {
+      for (const timeoutMs of [undefined, null, shortTimeout]) {
+        const taskId = `deadline-check-${++nextId}`
+        const scheduled = []
+        const hook = createHook({ init(_id, kind, _trigger, resource) {
+          if (kind === 'Timeout') scheduled.push(resource._idleTimeout)
+        } })
+        let pending
+        hook.enable()
+        try {
+          pending = service.execute({
+            taskId, mode, args: [], script: `await new Promise(resolve => setTimeout(resolve, ${shortTimeout * 4})); process.stdout.write('completed without a deadline');`,
+            ...(timeoutMs === undefined ? {} : { timeoutMs }),
+          })
+        } finally { hook.disable() }
+        pending.catch(() => {})
+        assert.deepEqual(scheduled, timeoutMs == null ? [] : [shortTimeout], `${mode}: null/omitted timeout allocates no deadline timer`)
+        const actual = await deadline(pending, `${mode} timeout ${timeoutMs}`)
+        assert.deepEqual(Object.keys(actual).sort(), ['code', 'stderr', 'stdout'])
+        assert.equal(actual.code, timeoutMs == null ? 0 : 124)
+        assert.equal(bytes(actual.stdout, 'stdout').toString(), timeoutMs == null ? 'completed without a deadline' : '')
+        assert.equal(bytes(actual.stderr, 'stderr').length, 0)
+      }
+      for (const timeoutMs of [0, -1, 0.5, Infinity, -Infinity, NaN, 2147483648, '25', false, {}]) {
+        await assert.rejects(start(mode, '', { timeoutMs }).promise, /invalid command.execute parameters/, `${mode}: invalid timeout ${timeoutMs}`)
+      }
+      assert.equal((await start(mode, '', { timeoutMs: 2147483647 }).promise).code, 0, 'maximum explicit deadline is accepted')
+    }
+
+    for (const returned of [
+      `(() => { const value = {}; value.self = value; return value })()`,
+      `1n`,
+      `({ nested: 1n })`,
+      `({ toJSON() { throw new Error('return values must never be serialized') } })`,
+    ]) {
+      const script = `process.stdout.write('written stdout'); process.stderr.write('written stderr'); return ${returned};`
+      const expected = await reference(script)
+      for (const mode of ['node', 'electron']) {
+        const job = start(mode, script, { stream: true })
+        const actual = await job.promise
+        assert.equal(actual.code, 0, `${mode}: non-JSON return is ignored`)
+        assert.deepEqual(bytes(actual.stdout, 'stdout'), expected.stdout, `${mode}: return does not pollute stdout`)
+        assert.deepEqual(bytes(actual.stderr, 'stderr'), expected.stderr, `${mode}: return does not pollute stderr`)
+        streamed(job.taskId, actual)
+      }
+    }
+
     const args = ['', 'spaces and quotes " \'', '中文', '\u0000', '--flag']
     for (const mode of ['node', 'electron']) {
-      const actual = await start(mode, `return { args, value: [1, true, null, { text: 'json' }] };`, { args }).promise
+      const actual = await start(mode, `process.stdout.write(JSON.stringify({ args, value: [1, true, null, { text: 'json' }] }));`, { args }).promise
       assert.equal(actual.code, 0)
-      assert.deepEqual(actual.result, { args, value: [1, true, null, { text: 'json' }] })
-      const identity = await start(mode, `const { isMainThread, threadId } = require('node:worker_threads'); return { pid: process.pid, isMainThread, threadId };`).promise
-      assert.equal(identity.result.pid, process.pid, `${mode}: no child process`)
-      assert.equal(identity.result.isMainThread, mode === 'electron', `${mode}: required execution thread`)
-      assert.equal(identity.result.threadId === 0, mode === 'electron')
+      assert.deepEqual(JSON.parse(bytes(actual.stdout, 'stdout').toString()), { args, value: [1, true, null, { text: 'json' }] })
+      const identity = await start(mode, `const { isMainThread, threadId } = require('node:worker_threads'); process.stdout.write(JSON.stringify({ pid: process.pid, isMainThread, threadId }));`).promise
+      const thread = JSON.parse(bytes(identity.stdout, 'stdout').toString())
+      assert.equal(thread.pid, process.pid, `${mode}: no child process`)
+      assert.equal(thread.isMainThread, mode === 'electron', `${mode}: required execution thread`)
+      assert.equal(thread.threadId === 0, mode === 'electron')
     }
 
     for (const script of [
@@ -163,7 +213,6 @@ async function checks() {
       assert.equal(actual.code, expected.code, 'worker natural/explicit exit code matches Node')
       assert.deepEqual(bytes(actual.stdout, 'stdout'), expected.stdout, 'worker timers finish naturally')
       assert.deepEqual(bytes(actual.stderr, 'stderr'), expected.stderr)
-      if (script.includes('body finished')) assert.equal(actual.result, 'body finished')
     }
     // Derive platform exit-status normalization from real Node, including boundary values.
     const exitMismatches = []
@@ -198,7 +247,9 @@ async function checks() {
       await until(() => chunksFor(job.taskId).length > 0 || finished, `${mode} first live chunk`)
       assert.equal(finished, false, `${mode}: first chunk must arrive BEFORE completion`)
       const result = await job.promise
-      assert.deepEqual(result.result, { done: true })
+      assert.equal(result.code, 0)
+      assert.deepEqual(bytes(result.stdout, 'stdout'), Buffer.from([0, 255, 195, 116, 97, 105, 108]))
+      assert.deepEqual(bytes(result.stderr, 'stderr'), Buffer.from([128, 10]))
       streamed(job.taskId, result)
       const count = chunksFor(job.taskId).length
       await sleep(40)
@@ -217,7 +268,6 @@ async function checks() {
     for (const [index, job] of concurrent.entries()) {
       const actual = concurrentResults[index]
       assert.equal(actual.code, 0)
-      assert.equal(actual.result, job.token)
       assert.equal(bytes(actual.stdout, 'stdout').toString(), Array.from({ length: 4 }, (_, i) => `${job.token}:${i}\n`).join(''))
       assert.equal(bytes(actual.stderr, 'stderr').toString(), Array.from({ length: 4 }, (_, i) => `${job.token}-err:${i}\n`).join(''))
       streamed(job.taskId, actual)
@@ -239,7 +289,7 @@ async function checks() {
     streamed(cancel.taskId, cancelled)
     const timeout = await start('node', `while (true) {}`, { timeoutMs: 150 }).promise
     assert.equal(timeout.code, 124, 'timeout terminates CPU-bound Worker')
-    assert.equal((await start('node', `return 'still usable';`).promise).result, 'still usable')
+    assert.equal(bytes((await start('node', `process.stdout.write('still usable');`).promise).stdout, 'stdout').toString(), 'still usable')
 
     for (const mode of ['node', 'electron']) {
       for (const stream of ['stdout', 'stderr']) {
@@ -271,7 +321,7 @@ async function checks() {
     assert.ok(closeHandlers.length > 0, 'service registers transport shutdown cleanup')
     const disconnected = new Executions(transport)
     const pendingId = 'disconnect-check'
-    const pending = deadline(disconnected.execute({ taskId: pendingId, mode: 'node', script: `process.stdout.write('disconnect-ready'); setInterval(() => {}, 25);`, args: [], timeoutMs: 2_000, maxOutputBytes: 1024, stream: true }), 'transport-close Worker')
+    const pending = deadline(disconnected.execute({ taskId: pendingId, mode: 'node', script: `process.stdout.write('disconnect-ready'); setInterval(() => {}, 25);`, args: [], timeoutMs: null, maxOutputBytes: 1024, stream: true }), 'transport-close Worker')
     pending.catch(() => {})
     try {
       await until(() => chunksFor(pendingId).length > 0, 'transport-close worker readiness')

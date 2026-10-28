@@ -14,7 +14,7 @@ export interface ExecutionParams {
   mode: 'node' | 'electron'
   script: string
   args: string[]
-  timeoutMs: number
+  timeoutMs: number | null
   maxOutputBytes: number
   stream: boolean
 }
@@ -23,7 +23,6 @@ export interface ExecutionResult {
   code: number
   stdout: string
   stderr: string
-  result: unknown
 }
 
 type Stream = 'stdout' | 'stderr'
@@ -156,7 +155,6 @@ class Execution {
   private cleanupWorker?: () => void
   private stopping = false
   private failure?: Error
-  private value: unknown = null
   private sequence = 0
 
   constructor(readonly params: ExecutionParams, private readonly transport: ExecutionTransport) {
@@ -164,7 +162,7 @@ class Execution {
   }
 
   start(): void {
-    this.deadline = setTimeout(() => this.stop(124), this.params.timeoutMs)
+    if (this.params.timeoutMs !== null) this.deadline = setTimeout(() => this.stop(124), this.params.timeoutMs)
     try {
       if (this.params.mode === 'node') this.startWorker()
       else this.startMain()
@@ -221,17 +219,14 @@ class Execution {
     })
     let started = false, exited = false, ended = 0
     const drain = (): void => { if (exited && ended === 2) this.finish() }
-    const onMessage = (event: { kind: string, json?: string, message?: string }): void => {
+    const onMessage = (event: { kind: string, message?: string }): void => {
       if (this.finished || this.stopping) return
       if (event.kind === 'started') started = true
       else if (event.kind === 'failure') this.fail(new Error(event.message ?? 'command worker failed'))
-      else if (event.kind === 'result') {
-        try { this.value = JSON.parse(event.json!) } catch (error) { this.fail(new Error(`invalid command worker result: ${message(error)}`)) }
-      }
     }
     const onError = (error: Error): void => {
       if (!started) this.fail(new Error(`command worker failed to start: ${message(error)}`))
-      else if (!this.stopping) { this.code = 1; this.value = null; this.output('stderr', Buffer.from(`${message(error)}\n`)) }
+      else if (!this.stopping) { this.code = 1; this.output('stderr', Buffer.from(`${message(error)}\n`)) }
     }
     const onExit = (code: number): void => { if (!this.stopping) this.code = code; exited = true; drain() }
     worker.on('message', onMessage)
@@ -272,13 +267,8 @@ class Execution {
         return new AsyncFunction('args', 'signal', 'require', 'process', 'console', this.params.script)(
           this.params.args, this.controller.signal, scriptRequire, facade, new Console({ stdout: process.stdout, stderr: process.stderr }),
         )
-      }).then((result) => {
+      }).then(() => {
         if (this.finished) return
-        try {
-          const json = JSON.stringify(result === undefined ? null : result)
-          if (json === undefined) throw new Error('result has no JSON representation')
-          this.value = JSON.parse(json)
-        } catch (error) { this.fail(new Error(`command result is not JSON serializable: ${message(error)}`)); return }
         this.ending = true
         this.clearTimers()
         clearTimeout(this.deadline)
@@ -296,7 +286,6 @@ class Execution {
   scriptError(error: unknown): void {
     if (this.finished || error === this.exitSignal) return
     this.code = 1
-    this.value = null
     try { this.output('stderr', Buffer.from(`${message(error)}\n`)) } catch (error) { this.fail(error); return }
     this.stop(1)
   }
@@ -316,7 +305,6 @@ class Execution {
     this.clearTimers()
     contexts.run(this, () => this.controller.abort())
     this.code = code
-    if (code === 130 || code === 124) this.value = null
     if (this.worker) {
       void this.worker.terminate().catch((error) => { this.failure ??= new Error(`command worker termination failed: ${message(error)}`); this.finish() })
     } else this.finish()
@@ -339,7 +327,7 @@ class Execution {
       this.flush()
       if (this.failure) throw this.failure
       const code = process.platform === 'win32' ? (this.code | 0) : (this.code & 255)
-      this.resolve({ code, stdout: Buffer.concat(this.stdout.buffers, this.stdout.length).toString('base64'), stderr: Buffer.concat(this.stderr.buffers, this.stderr.length).toString('base64'), result: this.value })
+      this.resolve({ code, stdout: Buffer.concat(this.stdout.buffers, this.stdout.length).toString('base64'), stderr: Buffer.concat(this.stderr.buffers, this.stderr.length).toString('base64') })
     } catch (error) { this.reject(error instanceof Error ? error : new Error(message(error))) }
   }
 }
@@ -358,12 +346,12 @@ export class Executions {
   async execute(input: unknown): Promise<ExecutionResult> {
     if (this.closed) throw new Error('command executions are closed')
     const p = input as Partial<ExecutionParams> | null
-    if (!p || typeof p !== 'object' || typeof p.taskId !== 'string' || !p.taskId.trim() || (p.mode !== 'node' && p.mode !== 'electron') || typeof p.script !== 'string' || !Array.isArray(p.args) || !p.args.every((arg) => typeof arg === 'string') || !Number.isInteger(p.timeoutMs) || p.timeoutMs! <= 0 || p.timeoutMs! > 2147483647 || (p.stream !== undefined && typeof p.stream !== 'boolean')) throw new TypeError('invalid command.execute parameters')
+    if (!p || typeof p !== 'object' || typeof p.taskId !== 'string' || !p.taskId.trim() || (p.mode !== 'node' && p.mode !== 'electron') || typeof p.script !== 'string' || !Array.isArray(p.args) || !p.args.every((arg) => typeof arg === 'string') || (p.timeoutMs != null && (!Number.isInteger(p.timeoutMs) || p.timeoutMs <= 0 || p.timeoutMs > 2147483647)) || (p.stream !== undefined && typeof p.stream !== 'boolean')) throw new TypeError('invalid command.execute parameters')
     const maxOutputBytes = p.maxOutputBytes === undefined ? 16 * 1024 * 1024 : p.maxOutputBytes
     if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > 256 * 1024 * 1024) throw new TypeError('invalid command maxOutputBytes (expected 1..268435456)')
     if (this.jobs.has(p.taskId)) throw new Error(`command task already exists: ${p.taskId}`)
     if (p.mode === 'electron') this.releaseMain ??= acquireMain()
-    const task = new Execution({ ...p, args: [...p.args], maxOutputBytes, stream: p.stream ?? false } as ExecutionParams, this.transport)
+    const task = new Execution({ ...p, args: [...p.args], timeoutMs: p.timeoutMs ?? null, maxOutputBytes, stream: p.stream ?? false } as ExecutionParams, this.transport)
     this.jobs.set(p.taskId, task)
     contexts.exit(() => task.start())
     try { return await task.done } finally { this.jobs.delete(task.params.taskId) }

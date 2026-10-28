@@ -2,6 +2,7 @@ use std::{
   future::{Future, IntoFuture},
   panic::{catch_unwind, AssertUnwindSafe},
   pin::Pin,
+  process::{ExitStatus, Output},
   sync::Arc,
   time::Duration,
 };
@@ -17,20 +18,6 @@ const DEFAULT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 const OUTPUT_QUEUE_CAPACITY: usize = 256;
 const RESPONSE_GRACE: Duration = Duration::from_secs(1);
-
-/// Captured raw output and the JSON value returned by a shared-main script.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CommandOutput {
-  pub code: i32,
-  pub stdout: Vec<u8>,
-  pub stderr: Vec<u8>,
-  pub result: Value,
-}
-
-impl CommandOutput {
-  /// Whether the script exited with code zero.
-  pub fn success(&self) -> bool { self.code == 0 }
-}
 
 /// The raw stream to which a command wrote a chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -56,16 +43,17 @@ type OutputCallback = Box<dyn FnMut(CommandChunk) + Send + 'static>;
 
 /// An owned shared-main script invocation. Awaiting starts execution.
 ///
-/// The async source body receives `args` and `signal`. Defaults are 30 seconds
+/// The async source body receives `args` and `signal`. Defaults are no deadline
 /// and 16 MiB of combined stdout/stderr. Dropping its pending future cancels it
-/// best effort on the current Tokio runtime; the server deadline is the fallback.
+/// best effort on the current Tokio runtime. Script return values are ignored;
+/// awaiting yields process status and raw output in [`Output`].
 #[must_use = "await the command to execute it"]
 pub struct Command {
   electron: Arc<Electron>,
   mode: Mode,
   script: String,
   args: Vec<String>,
-  timeout: Duration,
+  timeout: Option<Duration>,
   max_output_bytes: usize,
   on_output: Option<OutputCallback>,
 }
@@ -77,7 +65,7 @@ impl Command {
       mode,
       script: script.to_owned(),
       args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-      timeout: Duration::from_secs(30),
+      timeout: None,
       max_output_bytes: DEFAULT_OUTPUT_BYTES,
       on_output: None,
     }
@@ -91,14 +79,14 @@ impl Command {
   }
 
   /// Set a deadline of 1..=2,147,483,647 whole milliseconds, validated on await.
-  pub fn timeout(mut self, timeout: Duration) -> Self { self.timeout = timeout; self }
+  pub fn timeout(mut self, timeout: Duration) -> Self { self.timeout = Some(timeout); self }
 
   /// Limit combined raw stdout/stderr to 1..=256 MiB, validated on await.
   pub fn max_output_bytes(mut self, bytes: usize) -> Self { self.max_output_bytes = bytes; self }
 
-  async fn execute(self) -> Result<CommandOutput, Error> {
+  async fn execute(self) -> Result<Output, Error> {
     let Self { electron, mode, script, args, timeout, max_output_bytes, mut on_output } = self;
-    let timeout_ms = timeout_millis(timeout)?;
+    let timeout_ms = timeout.map(timeout_millis).transpose()?;
     if !(1..=MAX_OUTPUT_BYTES).contains(&max_output_bytes) {
       return Err("command max_output_bytes must be between 1 byte and 256 MiB".into());
     }
@@ -109,10 +97,9 @@ impl Command {
     let (route, mut chunks, mut failure) = CommandRoute::new(max_output_bytes);
     electron.register_command(task_id.clone(), route)?;
     let mut guard = CommandGuard { electron: Arc::clone(&electron), task_id: task_id.clone(), cancel: true };
-    let response = electron.call(Execute {
+    let response = electron.call_with_timeout(Execute {
       task_id, mode, script, args, timeout_ms, max_output_bytes, stream,
-      rpc_timeout: Duration::from_millis(timeout_ms) + RESPONSE_GRACE,
-    });
+    }, timeout.map(|timeout| timeout + RESPONSE_GRACE));
     tokio::pin!(response);
     let mut captured = CapturedOutput::default();
     let mut failure_open = true;
@@ -148,7 +135,7 @@ impl Command {
 }
 
 impl IntoFuture for Command {
-  type Output = Result<CommandOutput, Error>;
+  type Output = Result<Output, Error>;
   type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'static>>;
 
   fn into_future(self) -> Self::IntoFuture { Box::pin(self.execute()) }
@@ -169,17 +156,14 @@ struct Execute {
   mode: Mode,
   script: String,
   args: Vec<String>,
-  timeout_ms: u64,
+  timeout_ms: Option<u64>,
   max_output_bytes: usize,
   stream: bool,
-  #[serde(skip)]
-  rpc_timeout: Duration,
 }
 
 impl RpcRequest for Execute {
   type Response = WireOutput;
   const METHOD: &'static str = "command.execute";
-  fn timeout(&self) -> Duration { self.rpc_timeout }
 }
 
 #[derive(Serialize)]
@@ -217,14 +201,24 @@ struct WireOutput {
   code: i32,
   stdout: String,
   stderr: String,
-  result: Value,
 }
 
 impl WireOutput {
-  fn decode(self, limit: usize) -> Result<CommandOutput, Error> {
+  fn decode(self, limit: usize) -> Result<Output, Error> {
+    #[cfg(unix)]
+    let status = {
+      use std::os::unix::process::ExitStatusExt;
+      if !(0..=255).contains(&self.code) { return Err(protocol_error("command exit code must be between 0 and 255")); }
+      ExitStatus::from_raw(self.code << 8)
+    };
+    #[cfg(windows)]
+    let status = {
+      use std::os::windows::process::ExitStatusExt;
+      ExitStatus::from_raw(self.code as u32)
+    };
     let stdout = decode_bytes(&self.stdout, limit)?;
     let stderr = decode_bytes(&self.stderr, limit - stdout.len())?;
-    Ok(CommandOutput { code: self.code, stdout, stderr, result: self.result })
+    Ok(Output { status, stdout, stderr })
   }
 }
 
@@ -321,28 +315,41 @@ mod tests {
   use serde_json::json;
 
   #[test]
-  fn wire_output_preserves_raw_bytes_status_and_result() {
+  fn wire_output_preserves_raw_bytes_and_status() {
     let wire: WireOutput = serde_json::from_value(json!({
-      "code": 23, "stdout": "AP+A", "stderr": "wyg=", "result": {"ok": true}
+      "code": 23, "stdout": "AP+A", "stderr": "wyg="
     })).unwrap();
     let output = wire.decode(5).unwrap();
     assert_eq!(output.stdout, [0, 255, 128]);
     assert_eq!(output.stderr, [195, 40]);
-    assert!(!output.success());
-    assert_eq!(output.result, json!({"ok": true}));
+    assert_eq!(output.status.code(), Some(23));
+    assert!(!output.status.success());
     assert!(decode_bytes("***=", 8).is_err());
     assert!(decode_bytes("AQID", 2).is_err());
     let wire: WireOutput = serde_json::from_value(json!({
-      "code": 0, "stdout": "AQID", "stderr": "BA==", "result": null
+      "code": 0, "stdout": "AQID", "stderr": "BA=="
     })).unwrap();
     assert!(wire.decode(3).is_err());
-    for code in [0, 1, 124, 130] {
+    for code in [0, 1, 124, 130, 255] {
       let wire: WireOutput = serde_json::from_value(json!({
-        "code": code, "stdout": "", "stderr": "", "result": null
+        "code": code, "stdout": "", "stderr": ""
       })).unwrap();
       let output = wire.decode(1).unwrap();
-      assert_eq!(output.code, code);
-      assert_eq!(output.success(), code == 0);
+      assert_eq!(output.status.code(), Some(code));
+      assert_eq!(output.status.success(), code == 0);
+    }
+  }
+
+  #[test]
+  fn wire_status_validates_platform_exit_codes() {
+    for code in [i32::MIN, -1, 256, i32::MAX] {
+      let wire: WireOutput = serde_json::from_value(json!({
+        "code": code, "stdout": "", "stderr": ""
+      })).unwrap();
+      #[cfg(unix)]
+      assert!(wire.decode(1).is_err());
+      #[cfg(windows)]
+      assert_eq!(wire.decode(1).unwrap().status.code(), Some(code));
     }
   }
 
@@ -374,5 +381,6 @@ mod tests {
     assert!(timeout_millis(Duration::from_nanos(1_000_001)).is_err());
     assert!(timeout_millis(Duration::from_millis(2_147_483_648)).is_err());
     assert_eq!(timeout_millis(Duration::from_secs(30)).unwrap(), 30_000);
+    assert_eq!(timeout_millis(Duration::from_millis(2_147_483_647)).unwrap(), 2_147_483_647);
   }
 }

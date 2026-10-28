@@ -331,8 +331,12 @@ impl Electron {
 
   /// Execute a typed RPC without blocking the calling executor.
   pub async fn call<R: RpcRequest>(&self, request: R) -> Result<R::Response, Error> {
-    let method = request.method();
     let timeout = request.timeout();
+    self.call_with_timeout(request, Some(timeout)).await
+  }
+
+  pub(crate) async fn call_with_timeout<R: RpcRequest>(&self, request: R, timeout: Option<Duration>) -> Result<R::Response, Error> {
+    let method = request.method();
     let deferred = request.deferred();
     let notification = request.notification();
     let params = serde_json::to_value(request)?;
@@ -344,7 +348,7 @@ impl Electron {
     &self,
     method: &str,
     params: Value,
-    timeout: Duration,
+    timeout: Option<Duration>,
     deferred: bool,
     notification: bool,
   ) -> RpcResult {
@@ -357,8 +361,10 @@ impl Electron {
     let mut line = serde_json::to_vec(&request)?;
     line.push(b'\n');
     if self.closed.load(Ordering::SeqCst) { return Err(Error::ChannelDisconnected); }
-    if timeout.is_zero() { return Err(Error::IpcTimeout { timeout_duration: timeout }); }
-    let deadline = started.checked_add(timeout).ok_or(Error::IpcTimeout { timeout_duration: timeout })?;
+    // An unlimited response must still bound socket writes and writer ordering.
+    let write_timeout = timeout.unwrap_or(Duration::from_secs(5));
+    if write_timeout.is_zero() { return Err(Error::IpcTimeout { timeout_duration: write_timeout }); }
+    let deadline = started.checked_add(write_timeout).ok_or(Error::IpcTimeout { timeout_duration: write_timeout })?;
     if notification {
       self.write_line(line, deadline).await?;
       return Ok(Value::Null);
@@ -375,13 +381,13 @@ impl Electron {
       self.shutdown();
       return Err(error);
     }
-    let result = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), receiver).await;
+    let result = match timeout {
+      Some(timeout) => tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), receiver).await
+        .map_err(|_| Error::IpcTimeout { timeout_duration: timeout })?,
+      None => receiver.await,
+    };
     drop(guard);
-    match result {
-      Ok(Ok(result)) => result,
-      Ok(Err(_)) => Err(Error::ChannelDisconnected),
-      Err(_) => Err(Error::IpcTimeout { timeout_duration: timeout }),
-    }
+    result.unwrap_or(Err(Error::ChannelDisconnected))
   }
 
   async fn write_line(&self, line: Vec<u8>, deadline: Instant) -> Result<(), Error> {
@@ -789,7 +795,7 @@ mod tests {
       assert_eq!(params["mode"], "node");
       assert_eq!(params["script"], "return args[0]");
       assert_eq!(params["args"], json!(["owned argument"]));
-      assert_eq!(params["timeoutMs"], 30_000);
+      assert_eq!(params.get("timeoutMs"), Some(&Value::Null));
       assert_eq!(params["maxOutputBytes"], 16 * 1024 * 1024);
       assert_eq!(params["stream"], true);
       writeln!(reader.get_mut(), "{}", json!({"event":"command.output","params":{
@@ -800,7 +806,7 @@ mod tests {
         ]
       }})).unwrap();
       writeln!(reader.get_mut(), "{}", json!({"id":request["id"],"result":{
-        "code":23,"stdout":"AP9h","stderr":"gA==","result":{"answer":42}
+        "code":23,"stdout":"AP9h","stderr":"gA=="
       }})).unwrap();
       reader.get_ref().shutdown(Shutdown::Both).unwrap();
     });
@@ -820,10 +826,93 @@ mod tests {
     assert_eq!(received[0].data, [0, 255]);
     assert_eq!(output.stdout, [0, 255, b'a']);
     assert_eq!(output.stderr, [128]);
-    assert_eq!(output.result, json!({"answer":42}));
-    assert_eq!(output.code, 23);
+    assert_eq!(output.status.code(), Some(23));
+    assert!(!output.status.success());
     assert!(electron.command_routes.lock().unwrap().is_empty());
     assert!(events.try_iter().all(|event| event["event"] == "ipc.closed"));
+  }
+
+  #[tokio::test]
+  async fn default_command_has_no_response_deadline_after_the_generic_rpc_timeout() {
+    use std::future::IntoFuture as _;
+    let (electron, peer, reader) = loopback(READY);
+    electron.start_reader(reader).unwrap();
+    let (executed, received) = oneshot::channel();
+    let (reply, release) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+      let mut reader = BufReader::new(peer);
+      let mut line = String::new();
+      reader.read_line(&mut line).unwrap();
+      let request: Value = serde_json::from_str(&line).unwrap();
+      assert_eq!(request["method"], "command.execute");
+      assert_eq!(request["params"].get("timeoutMs"), Some(&Value::Null));
+      executed.send(()).unwrap();
+      release.recv_timeout(WAIT + Duration::from_secs(2)).unwrap();
+      writeln!(reader.get_mut(), "{}", json!({"id":request["id"],"result":{
+        "code":0,"stdout":"AP8=","stderr":"gA=="
+      }})).unwrap();
+      reader
+    });
+    let mut command = electron.node_in_main("await new Promise(() => {})", &[]).into_future();
+    tokio::select! {
+      result = &mut command => panic!("command unexpectedly completed: {result:?}"),
+      received = received => received.unwrap(),
+    }
+    // test-util is not enabled: a finite loopback wait crosses the normal 5s RPC deadline.
+    assert!(tokio::time::timeout(WAIT + Duration::from_millis(100), &mut command).await.is_err());
+    assert_eq!(electron.pending.lock().unwrap().len(), 1);
+    assert_eq!(electron.command_routes.lock().unwrap().len(), 1);
+    reply.send(()).unwrap();
+    let output: std::process::Output = tokio::time::timeout(WAIT, command).await.unwrap().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, [0, 255]);
+    assert_eq!(output.stderr, [128]);
+    assert!(electron.pending.lock().unwrap().is_empty());
+    assert!(electron.command_routes.lock().unwrap().is_empty());
+    let _peer = peer.join().unwrap();
+  }
+
+  #[tokio::test]
+  async fn explicit_command_response_deadline_includes_grace_and_posts_cancellation() {
+    let (electron, peer, reader) = loopback(READY);
+    electron.start_reader(reader).unwrap();
+    let (cancelled, cancellation) = oneshot::channel();
+    let peer = std::thread::spawn(move || {
+      let mut reader = BufReader::new(peer);
+      let mut line = String::new();
+      reader.read_line(&mut line).unwrap();
+      let request: Value = serde_json::from_str(&line).unwrap();
+      assert_eq!(request["params"]["timeoutMs"], 10);
+      line.clear();
+      reader.read_line(&mut line).unwrap();
+      let cancel: Value = serde_json::from_str(&line).unwrap();
+      assert_eq!(cancel["method"], "command.cancel");
+      assert_eq!(cancel["notification"], true);
+      assert_eq!(cancel["params"]["taskId"], request["params"]["taskId"]);
+      cancelled.send(()).unwrap();
+      reader
+    });
+    let started = Instant::now();
+    let error = electron.electron_in_main("await new Promise(() => {})", &[])
+      .timeout(Duration::from_millis(10)).await.unwrap_err();
+    assert!(matches!(error, Error::IpcTimeout { timeout_duration } if timeout_duration == Duration::from_millis(1010)));
+    assert!(started.elapsed() >= Duration::from_millis(1010));
+    assert!(electron.pending.lock().unwrap().is_empty());
+    assert!(electron.command_routes.lock().unwrap().is_empty());
+    tokio::time::timeout(WAIT, cancellation).await.unwrap().unwrap();
+    assert!(!electron.closed.load(Ordering::SeqCst));
+    let _peer = peer.join().unwrap();
+  }
+
+  #[tokio::test]
+  async fn unlimited_command_still_bounds_writer_order_and_cleans_up_on_write_timeout() {
+    let (electron, _peer, _reader) = loopback(READY);
+    let _order = electron.writer_order.lock().await;
+    let error = electron.node_in_main("", &[]).await.unwrap_err();
+    assert!(matches!(error, Error::IpcTimeout { timeout_duration } if timeout_duration <= WAIT));
+    assert!(electron.closed.load(Ordering::SeqCst));
+    assert!(electron.pending.lock().unwrap().is_empty());
+    assert!(electron.command_routes.lock().unwrap().is_empty());
   }
 
   #[test]
@@ -899,7 +988,7 @@ mod tests {
       reader.read_line(&mut line).unwrap();
       let request: Value = serde_json::from_str(&line).unwrap();
       writeln!(reader.get_mut(), "{}", json!({"id":request["id"],"result":{
-        "code":0,"stdout":"YQ==","stderr":"","result":null
+        "code":0,"stdout":"YQ==","stderr":""
       }})).unwrap();
       line.clear();
       reader.read_line(&mut line).unwrap();
@@ -936,7 +1025,7 @@ mod tests {
   async fn cancelled_rpc_removes_its_pending_waiter() {
     let (electron, _peer, _reader) = loopback(READY);
     let _order = electron.writer_order.lock().await;
-    let mut request = Box::pin(electron.rpc_value("cancel", Value::Null, WAIT, false, false));
+    let mut request = Box::pin(electron.rpc_value("cancel", Value::Null, Some(WAIT), false, false));
     assert!(std::future::poll_fn(|cx| {
       std::task::Poll::Ready(std::future::Future::poll(request.as_mut(), cx))
     }).await.is_pending());

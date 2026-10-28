@@ -13,7 +13,7 @@ mod pe;
 
 use std::{fs, io, path::{Path, PathBuf}, process::{Command as ProcessCommand, Output}};
 use acquisition::DistributionTarget;
-pub use command::{Command, CommandChunk, CommandOutput, OutputStream};
+pub use command::{Command, CommandChunk, OutputStream};
 pub use ipc::{Electron, Event, RpcRequest};
 
 pub use error::{ElectronError, Error};

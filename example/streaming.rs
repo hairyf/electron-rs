@@ -1,5 +1,6 @@
 //! cargo run --manifest-path example/Cargo.toml --bin streaming
 //! Run acquisition first. Real Electron requires a desktop/display (e.g. Xvfb on Linux).
+//! The timeouts and output caps below are optional. Metadata is explicitly written to stdout.
 
 use std::{path::Path, time::Duration};
 
@@ -37,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
           await delay(250, undefined, { signal });
         }
         console.error('worker stderr');
-        return { pid: process.pid, isMainThread, threadId };
+        console.log(JSON.stringify({ pid: process.pid, isMainThread, threadId }));
       "#,
           &["job"],
         )
@@ -58,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
           await new Promise(resolve => setTimeout(resolve, 250));
         }
         console.error('main stderr');
-        return { pid: process.pid, isMainThread, threadId, ready: app.isReady() };
+        console.log(JSON.stringify({ pid: process.pid, isMainThread, threadId, ready: app.isReady() }));
       "#,
           &["job"],
         )
@@ -70,14 +71,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   );
   let worker = worker?;
   let main = main?;
-  assert!(worker.success(), "worker: {worker:?}");
-  assert!(main.success(), "main: {main:?}");
-  assert_eq!(worker.result["isMainThread"], false);
-  assert_eq!(main.result["isMainThread"], true);
-  assert_eq!(main.result["ready"], true);
-  assert_eq!(worker.result["pid"], main.result["pid"]);
-  println!("worker result: {}", worker.result);
-  println!("main result: {}", main.result);
+  assert!(worker.status.success(), "worker: {worker:?}");
+  assert!(main.status.success(), "main: {main:?}");
+  let worker_stdout = std::str::from_utf8(&worker.stdout)?;
+  let main_stdout = std::str::from_utf8(&main.stdout)?;
+  let worker_metadata: serde_json::Value =
+    serde_json::from_str(worker_stdout.lines().last().ok_or("missing worker metadata")?)?;
+  let main_metadata: serde_json::Value =
+    serde_json::from_str(main_stdout.lines().last().ok_or("missing main metadata")?)?;
+  assert_eq!(worker_metadata["isMainThread"], false);
+  assert_eq!(main_metadata["isMainThread"], true);
+  assert_eq!(main_metadata["ready"], true);
+  assert_eq!(worker_metadata["pid"], main_metadata["pid"]);
+  println!("worker metadata: {worker_metadata}");
+  println!("main metadata: {main_metadata}");
   println!(
     "captured worker/main stdout: {}/{} bytes",
     worker.stdout.len(),

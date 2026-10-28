@@ -18,22 +18,13 @@ if (parentPort) {
   // The owner waits for the real thread exit and both stdio pipes to finish.
   port.unref()
   void (async () => {
-    let result: unknown
     try {
-      result = await new AsyncFunction('args', 'signal', 'require', 'process', 'console', script)(
+      await new AsyncFunction('args', 'signal', 'require', 'process', 'console', script)(
         args, new AbortController().signal, scriptRequire, process, console,
       )
     } catch (error) {
       process.exitCode = 1
       process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
-      return
-    }
-    try {
-      const json = JSON.stringify(result === undefined ? null : result)
-      if (json === undefined) throw new Error('result has no JSON representation')
-      port.postMessage({ kind: 'result', json })
-    } catch (error) {
-      port.postMessage({ kind: 'failure', message: `command result is not JSON serializable: ${error instanceof Error ? error.message : String(error)}` })
     }
   })().catch((error) => {
     // Bootstrap/message failures must not become an unobserved rejection.
