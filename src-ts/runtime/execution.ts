@@ -1,8 +1,7 @@
 import { AsyncLocalStorage, createHook } from 'node:async_hooks'
 import { Console } from 'node:console'
-import { prepareCommand, runCommand } from './command-cli'
+import { createRequire } from 'node:module'
 import path from 'node:path'
-import { Worker } from 'node:worker_threads'
 import { types } from 'node:util'
 
 export interface ExecutionTransport {
@@ -12,8 +11,7 @@ export interface ExecutionTransport {
 
 export interface ExecutionParams {
   taskId: string
-  mode: 'node' | 'electron'
-  args: string[]
+  script: string
   timeoutMs: number | null
   maxOutputBytes: number
   stream: boolean
@@ -32,7 +30,7 @@ type Output = { buffers: Buffer[], length: number, pending?: Chunk }
 const chunkBytes = 32 * 1024
 const contexts = new AsyncLocalStorage<Execution>()
 const promises = new WeakMap<Promise<unknown>, Execution>()
-const resources = new Map<number, Execution>()
+const timers = new Map<number, Execution>()
 let mainUsers = 0
 let restoreMain: (() => void) | undefined
 
@@ -84,45 +82,19 @@ function acquireMain(): () => void {
         else outsideCode = value as typeof process.exitCode
       },
     })
-    const argvDescriptor = Object.getOwnPropertyDescriptor(process, 'argv')!
-    let outsideArgv = process.argv
-    const getArgv = () => contexts.getStore()?.argv ?? outsideArgv
-    Object.defineProperty(process, 'argv', {
-      configurable: true, enumerable: argvDescriptor.enumerable,
-      get: getArgv,
-      set(value: string[]) { const task = contexts.getStore(); if (task) task.argv = value; else outsideArgv = value },
-    })
     const hook = createHook({
       init(id, kind, _trigger, resource) {
         const task = contexts.getStore()
         if (!task) return
-        if (kind === 'PROMISE') { promises.set(resource as Promise<unknown>, task); return }
-        // Promises alone do not keep Node alive. Track native work, not GC-dependent wrappers.
-        if (kind === 'TickObject' || kind === 'Microtask' || kind.endsWith('WRAP') && !/^(TCP|PIPE|UDP|TTY|TLS|WRITE|SHUTDOWN|FSREQ|GETADDRINFO|GETNAMEINFO|CONNECT)/.test(kind)) return
-        if (task.finished || task.ending) {
-          if (kind === 'Timeout' || kind === 'Immediate') process.nextTick(() => clearTimer({ kind, handle: resource } as Timer))
-          return
-        }
-        if (kind === 'Timeout' || kind === 'Immediate') task.timers.set(id, { kind, handle: resource } as Timer)
-        task.resources.add(id)
-        resources.set(id, task)
-      },
-      after(id) {
-        const task = resources.get(id)
-        const timer = task?.timers.get(id)
-        if (timer && !(timer.handle as NodeJS.Timeout & { _repeat?: number })._repeat) {
-          task!.timers.delete(id)
-          task!.resources.delete(id)
-          resources.delete(id)
-        }
-        task?.settleMain()
+        if (kind === 'PROMISE') promises.set(resource as Promise<unknown>, task)
+        if (kind !== 'Timeout' && kind !== 'Immediate') return
+        const timer = { kind, handle: resource } as Timer
+        if (task.finished || task.ending) process.nextTick(() => clearTimer(timer))
+        else { task.timers.set(id, timer); timers.set(id, task) }
       },
       destroy(id) {
-        const task = resources.get(id)
-        task?.timers.delete(id)
-        task?.resources.delete(id)
-        resources.delete(id)
-        task?.settleMain()
+        timers.get(id)?.timers.delete(id)
+        timers.delete(id)
       },
     }).enable()
     const uncaught = (error: Error): void => {
@@ -143,7 +115,6 @@ function acquireMain(): () => void {
       process.removeListener('unhandledRejection', rejected)
       for (const stream of ['stdout', 'stderr'] as const) if (process[stream].write === writes[stream]) process[stream].write = originals[stream]
       if (process.exit === trappedExit) process.exit = originals.exit
-      if (Object.getOwnPropertyDescriptor(process, 'argv')?.get === getArgv) Object.defineProperty(process, 'argv', { ...argvDescriptor, value: outsideArgv })
       if (descriptor.configurable && Object.getOwnPropertyDescriptor(process, 'exitCode')?.get === getCode) {
         Object.defineProperty(process, 'exitCode', descriptor.get || descriptor.set ? descriptor : { ...descriptor, value: outsideCode })
       }
@@ -164,9 +135,6 @@ function clearTimer(timer: Timer): void {
 
 class Execution {
   readonly timers = new Map<number, Timer>()
-  readonly resources = new Set<number>()
-  argv: string[] = [process.execPath]
-  private bodyDone = false
   readonly controller = new AbortController()
   readonly done: Promise<ExecutionResult>
   code = 0
@@ -181,8 +149,6 @@ class Execution {
   private deadline?: NodeJS.Timeout
   private scheduled?: NodeJS.Immediate
   private finalTurn?: NodeJS.Immediate
-  private worker?: Worker
-  private cleanupWorker?: () => void
   private stopping = false
   private failure?: Error
   private sequence = 0
@@ -193,10 +159,7 @@ class Execution {
 
   start(): void {
     if (this.params.timeoutMs !== null) this.deadline = setTimeout(() => this.stop(124), this.params.timeoutMs)
-    try {
-      if (this.params.mode === 'node') this.startWorker()
-      else this.startMain()
-    } catch (error) { this.fail(error) }
+    try { this.startMain() } catch (error) { this.fail(error) }
   }
 
   output(stream: Stream, data: Buffer): void {
@@ -241,78 +204,29 @@ class Execution {
     }
   }
 
-  private startWorker(): void {
-    const worker = this.worker = new Worker(path.join(__dirname, 'command-worker.cjs'), {
-      stdout: true,
-      stderr: true,
-      workerData: { args: this.params.args },
-    })
-    let started = false, exited = false, ended = 0
-    const drain = (): void => { if (exited && ended === 2) this.finish() }
-    const onMessage = (event: { kind: string, message?: string }): void => {
-      if (this.finished || this.stopping) return
-      if (event.kind === 'started') started = true
-      else if (event.kind === 'failure') this.fail(new Error(event.message ?? 'command worker failed'))
-    }
-    const onError = (error: Error): void => {
-      if (!started) this.fail(new Error(`command worker failed to start: ${message(error)}`))
-      else if (!this.stopping) { this.code = 1; this.output('stderr', Buffer.from(`${message(error)}\n`)) }
-    }
-    const onExit = (code: number): void => { if (!this.stopping) this.code = code; exited = true; drain() }
-    worker.on('message', onMessage)
-    worker.on('error', onError)
-    worker.on('exit', onExit)
-    const cleanups: (() => void)[] = []
-    for (const stream of ['stdout', 'stderr'] as const) {
-      const pipe = worker[stream]!
-      let closed = false
-      const data = (chunk: Buffer): void => this.output(stream, chunk)
-      const end = (): void => { if (!closed) { closed = true; ended++; drain() } }
-      const error = (error: Error): void => { this.fail(new Error(`command ${stream} pipe failed: ${message(error)}`)); end() }
-      pipe.on('data', data)
-      pipe.on('end', end)
-      pipe.on('close', end)
-      pipe.on('error', error)
-      cleanups.push(() => { pipe.removeListener('data', data); pipe.removeListener('end', end); pipe.removeListener('close', end); pipe.removeListener('error', error) })
-    }
-    this.cleanupWorker = () => {
-      worker.removeListener('message', onMessage)
-      worker.removeListener('error', onError)
-      worker.removeListener('exit', onExit)
-      for (const cleanup of cleanups) cleanup()
-    }
-  }
-
   private startMain(): void {
+    const requireScript = createRequire(path.join(process.cwd(), '__electron_rs_command__.cjs'))
     const facade = Object.create(process, {
       exit: { value: (code?: number | string) => this.exit(code) },
       exitCode: { get: () => this.code, set: (code: unknown) => { this.code = exitCode(code) } },
-      argv: { get: () => this.argv, set: (argv: string[]) => { this.argv = argv } },
     }) as NodeJS.Process
+    const scriptRequire = Object.assign((id: string) => id === 'process' || id === 'node:process' ? facade : requireScript(id), requireScript)
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
     contexts.run(this, () => {
       void Promise.resolve().then(() => {
         if (this.finished) return
-        const command = prepareCommand(this.params.args, 'electron')
-        this.argv = command.argv
-        return runCommand(command, new Console({ stdout: process.stdout, stderr: process.stderr }), facade)
+        return new AsyncFunction('signal', 'require', 'process', 'console', this.params.script)(
+          this.controller.signal, scriptRequire, facade, new Console({ stdout: process.stdout, stderr: process.stderr }),
+        )
       }).then(() => {
-        this.bodyDone = true
-        this.settleMain()
+        if (this.finished) return
+        this.ending = true
+        this.clearTimers()
+        clearTimeout(this.deadline)
+        // Observe this turn's unhandled rejections; detached work is not a task lifetime.
+        this.finalTurn = contexts.exit(() => setImmediate(() => this.finish()))
       }, (error) => this.scriptError(error)).catch((error) => this.fail(error))
     })
-  }
-
-  settleMain(): void {
-    if (!this.bodyDone || this.finished || this.ending || this.finalTurn) return
-    // ponytail: native async_hooks lifetimes approximate CLI liveness; full host isolation needs a separate process.
-    this.finalTurn = contexts.exit(() => setImmediate(() => {
-      this.finalTurn = undefined
-      const active = [...this.resources].some(id => {
-        const timer = this.timers.get(id)
-        return !timer || timer.handle.hasRef()
-      })
-      if (!active) this.finish()
-    }))
   }
 
   exit(value?: number | string): never {
@@ -342,16 +256,12 @@ class Execution {
     this.clearTimers()
     contexts.run(this, () => this.controller.abort())
     this.code = code
-    if (this.worker) {
-      void this.worker.terminate().catch((error) => { this.failure ??= new Error(`command worker termination failed: ${message(error)}`); this.finish() })
-    } else this.finish()
+    this.finish()
   }
 
   private clearTimers(): void {
-    for (const timer of this.timers.values()) clearTimer(timer)
+    for (const [id, timer] of this.timers) { clearTimer(timer); timers.delete(id) }
     this.timers.clear()
-    for (const id of this.resources) resources.delete(id)
-    this.resources.clear()
   }
 
   private finish(): void {
@@ -361,7 +271,6 @@ class Execution {
     clearImmediate(this.scheduled)
     clearImmediate(this.finalTurn)
     this.clearTimers()
-    this.cleanupWorker?.()
     try {
       this.flush()
       if (this.failure) throw this.failure
@@ -385,12 +294,12 @@ export class Executions {
   async execute(input: unknown): Promise<ExecutionResult> {
     if (this.closed) throw new Error('command executions are closed')
     const p = input as Partial<ExecutionParams> | null
-    if (!p || typeof p !== 'object' || typeof p.taskId !== 'string' || !p.taskId.trim() || (p.mode !== 'node' && p.mode !== 'electron') || !Array.isArray(p.args) || !p.args.every((arg) => typeof arg === 'string') || (p.timeoutMs != null && (!Number.isInteger(p.timeoutMs) || p.timeoutMs <= 0 || p.timeoutMs > 2147483647)) || (p.stream !== undefined && typeof p.stream !== 'boolean')) throw new TypeError('invalid command.execute parameters')
+    if (!p || typeof p !== 'object' || typeof p.taskId !== 'string' || !p.taskId.trim() || typeof p.script !== 'string' || (p.timeoutMs != null && (!Number.isInteger(p.timeoutMs) || p.timeoutMs <= 0 || p.timeoutMs > 2147483647)) || (p.stream !== undefined && typeof p.stream !== 'boolean')) throw new TypeError('invalid command.execute parameters')
     const maxOutputBytes = p.maxOutputBytes === undefined ? 16 * 1024 * 1024 : p.maxOutputBytes
     if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > 256 * 1024 * 1024) throw new TypeError('invalid command maxOutputBytes (expected 1..268435456)')
     if (this.jobs.has(p.taskId)) throw new Error(`command task already exists: ${p.taskId}`)
-    if (p.mode === 'electron') this.releaseMain ??= acquireMain()
-    const task = new Execution({ ...p, args: [...p.args], timeoutMs: p.timeoutMs ?? null, maxOutputBytes, stream: p.stream ?? false } as ExecutionParams, this.transport)
+    this.releaseMain ??= acquireMain()
+    const task = new Execution({ ...p, timeoutMs: p.timeoutMs ?? null, maxOutputBytes, stream: p.stream ?? false } as ExecutionParams, this.transport)
     this.jobs.set(p.taskId, task)
     contexts.exit(() => task.start())
     try { return await task.done } finally { this.jobs.delete(task.params.taskId) }

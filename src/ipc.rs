@@ -16,7 +16,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
-use crate::{command::{CommandRoute, Mode}, Error};
+use crate::{command::CommandRoute, Error};
 
 const EVENT_CAPACITY: usize = 1024;
 
@@ -406,19 +406,19 @@ impl Electron {
       .map_err(|error| Error::with_source("Electron RPC writer failed", error))?
   }
 
-  /// Run Node CLI arguments in a fresh Worker with this Electron process's PID.
-  /// Supports eval/print, version and CommonJS entries; no subprocess or REPL.
-  /// Startup-only switches are rejected. Await the builder to execute it.
-  pub fn node(self: &Arc<Self>, args: &[&str]) -> crate::Command {
-    crate::Command::new(Arc::clone(self), Mode::Node, args)
+  /// Forward CLI arguments to this binary in a separate Node-mode process.
+  /// Sets `ELECTRON_RUN_AS_NODE=1`, exactly like [`crate::node`], without RPC.
+  /// Blocks until exit; use `spawn_blocking` when called from async code.
+  pub fn node(&self, args: &[&str]) -> io::Result<std::process::Output> {
+    crate::node(&self.binary, args)
   }
 
-  /// Run CLI arguments on the connected Electron main thread, with the same PID.
-  /// Supports eval/print, version and CommonJS entries with Electron APIs.
-  /// This is not a fresh app: startup-only switches are rejected, global/module
-  /// state is shared, and cancellation of synchronous code is cooperative.
-  pub fn electron(self: &Arc<Self>, args: &[&str]) -> crate::Command {
-    crate::Command::new(Arc::clone(self), Mode::Electron, args)
+  /// Run an async function body on the connected Electron main thread.
+  /// Receives `signal`, `require`, `process` and `console`, not CLI arguments.
+  /// Await the builder to execute; return values are ignored. Cancellation is
+  /// cooperative and cannot interrupt synchronous JavaScript on the main thread.
+  pub fn run(self: &Arc<Self>, script: &str) -> crate::Command {
+    crate::Command::new(Arc::clone(self), script)
   }
 
   pub(crate) fn command_task_id(&self) -> Result<String, Error> {
@@ -767,6 +767,19 @@ mod tests {
     (electron, peer, reader)
   }
 
+  #[test]
+  fn node_forwards_to_the_binary_without_sending_rpc() {
+    let (mut electron, _peer, _reader) = loopback(READY);
+    Arc::get_mut(&mut electron).unwrap().binary = std::env::current_exe().unwrap();
+    // The existing helper executable prints its inherited mode and exits 23.
+    let output = electron.node(&["--exact", "tests::node_worker", "--nocapture"]).unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("node stdout"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("node stderr"));
+    assert_eq!(electron.next_id.load(Ordering::Relaxed), 0);
+    assert!(electron.pending.lock().unwrap().is_empty());
+  }
+
   #[tokio::test]
   async fn builtin_requests_round_trip_through_the_connected_client() {
     use crate::{rpc::window::CursorPosition, SetTheme, Theme};
@@ -808,9 +821,9 @@ mod tests {
       assert_eq!(request["method"], "command.execute");
       let params = &request["params"];
       assert!(params["taskId"].is_string());
-      assert_eq!(params["mode"], "node");
-      assert!(params.get("script").is_none());
-      assert_eq!(params["args"], json!(["-p", "process.argv[1]", "--", "owned argument"]));
+      assert!(params.get("mode").is_none());
+      assert!(params.get("args").is_none());
+      assert_eq!(params["script"], "return 'owned script'");
       assert_eq!(params.get("timeoutMs"), Some(&Value::Null));
       assert_eq!(params["maxOutputBytes"], 16 * 1024 * 1024);
       assert_eq!(params["stream"], true);
@@ -827,9 +840,8 @@ mod tests {
       reader.get_ref().shutdown(Shutdown::Both).unwrap();
     });
     let command = {
-      let script = String::from("process.argv[1]");
-      let arg = String::from("owned argument");
-      electron.node(&["-p", &script, "--", &arg])
+      let script = String::from("return 'owned script'");
+      electron.run(&script)
     };
     let (chunks, received) = mpsc::channel();
     let future = command.on_output(move |chunk| chunks.send(chunk).unwrap()).into_future();
@@ -869,7 +881,7 @@ mod tests {
       }})).unwrap();
       reader
     });
-    let mut command = electron.node(&["-e", "new Promise(() => {})"]).into_future();
+    let mut command = electron.run("await new Promise(() => {})").into_future();
     tokio::select! {
       result = &mut command => panic!("command unexpectedly completed: {result:?}"),
       received = received => received.unwrap(),
@@ -909,7 +921,7 @@ mod tests {
       reader
     });
     let started = Instant::now();
-    let error = electron.electron(&["-e", "new Promise(() => {})"])
+    let error = electron.run("await new Promise(() => {})")
       .timeout(Duration::from_millis(10)).await.unwrap_err();
     assert!(matches!(error, Error::IpcTimeout { timeout_duration } if timeout_duration == Duration::from_millis(1010)));
     assert!(started.elapsed() >= Duration::from_millis(1010));
@@ -924,7 +936,7 @@ mod tests {
   async fn unlimited_command_still_bounds_writer_order_and_cleans_up_on_write_timeout() {
     let (electron, _peer, _reader) = loopback(READY);
     let _order = electron.writer_order.lock().await;
-    let error = electron.node(&["-e", ""]).await.unwrap_err();
+    let error = electron.run("").await.unwrap_err();
     assert!(matches!(error, Error::IpcTimeout { timeout_duration } if timeout_duration <= WAIT));
     assert!(electron.closed.load(Ordering::SeqCst));
     assert!(electron.pending.lock().unwrap().is_empty());
@@ -961,7 +973,8 @@ mod tests {
       reader.read_line(&mut line).unwrap();
       let request: Value = serde_json::from_str(&line).unwrap();
       assert_eq!(request["method"], "command.execute");
-      assert_eq!(request["params"]["mode"], "electron");
+      assert!(request["params"].get("mode").is_none());
+      assert_eq!(request["params"]["script"], "await new Promise(() => {})");
       assert_eq!(request["params"]["stream"], false);
       assert_eq!(request["params"]["timeoutMs"], 1000);
       assert_eq!(request["params"]["maxOutputBytes"], 32);
@@ -975,7 +988,7 @@ mod tests {
       cancelled.send(()).unwrap();
       reader
     });
-    let future = electron.electron(&["-e", "new Promise(() => {})"])
+    let future = electron.run("await new Promise(() => {})")
       .timeout(Duration::from_secs(1)).max_output_bytes(32).into_future();
     let mut future = Box::pin(future);
     tokio::select! {
@@ -993,9 +1006,9 @@ mod tests {
   #[tokio::test]
   async fn shared_main_validates_limits_and_rejects_incomplete_streams() {
     let (electron, peer, reader) = loopback(READY);
-    assert!(electron.node(&["-e", ""]).timeout(Duration::ZERO).await.is_err());
-    assert!(electron.node(&["-e", ""]).max_output_bytes(0).await.is_err());
-    assert!(electron.node(&["-e", ""]).max_output_bytes(256 * 1024 * 1024 + 1).await.is_err());
+    assert!(electron.run("").timeout(Duration::ZERO).await.is_err());
+    assert!(electron.run("").max_output_bytes(0).await.is_err());
+    assert!(electron.run("").max_output_bytes(256 * 1024 * 1024 + 1).await.is_err());
     assert!(electron.command_routes.lock().unwrap().is_empty());
     electron.start_reader(reader).unwrap();
     let peer = std::thread::spawn(move || {
@@ -1013,7 +1026,7 @@ mod tests {
       assert_eq!(cancel["params"]["taskId"], request["params"]["taskId"]);
       reader
     });
-    let error = electron.node(&["-e", ""]).on_output(|_| {}).await.unwrap_err();
+    let error = electron.run("").on_output(|_| {}).await.unwrap_err();
     assert!(error.to_string().contains("do not match"));
     assert!(electron.command_routes.lock().unwrap().is_empty());
     // Let the Drop guard's best-effort cancellation run on this current runtime.
@@ -1031,7 +1044,7 @@ mod tests {
       reader.read_line(&mut line).unwrap();
       reader.get_ref().shutdown(Shutdown::Both).unwrap();
     });
-    assert!(matches!(electron.node(&["-e", ""]).await, Err(Error::ChannelDisconnected)));
+    assert!(matches!(electron.run("").await, Err(Error::ChannelDisconnected)));
     peer.join().unwrap();
     assert!(electron.command_routes.lock().unwrap().is_empty());
     assert!(electron.pending.lock().unwrap().is_empty());

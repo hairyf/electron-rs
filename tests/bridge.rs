@@ -414,69 +414,63 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     .expect("direct connected Node binary-output oracle");
   assert!(oracle.status.success(), "{oracle:?}");
   block_on(async {
-    // Metadata is ordinary stdout; CLI eval uses the connected process PID.
-    let identity = "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,electron:process.versions.electron}));1n;";
-    let worker: std::process::Output = electron.node(&["-e", identity]).timeout(WAIT).await.unwrap();
-    assert!(worker.status.success(), "{worker:?}");
-    assert!(worker.stderr.is_empty());
-    let worker: Value = serde_json::from_slice(&worker.stdout).unwrap();
-    assert_eq!(worker["isMainThread"], false);
-    assert!(worker["threadId"].as_u64().unwrap() > 0);
-    assert_eq!(worker["electron"], DEFAULT_VERSION);
-    let main: std::process::Output = electron.electron(&["-e",
-      "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,ready:require('electron').app.isReady(),electron:process.versions.electron}));const ignored={};ignored.self=ignored;ignored;",
-    ]).timeout(WAIT).await.unwrap();
+    // Node forwards native CLI args to another PID; run keeps the existing main.
+    let identity = "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,electron:process.versions.electron,nodeMode:process.env.ELECTRON_RUN_AS_NODE}));";
+    let node_client = Arc::clone(electron);
+    let node = tokio::task::spawn_blocking(move || node_client.node(&["-e", identity])).await.unwrap().unwrap();
+    assert!(node.status.success(), "{node:?}");
+    let node: Value = serde_json::from_slice(&node.stdout).unwrap();
+    assert_eq!(node["isMainThread"], true);
+    assert_eq!(node["threadId"], 0);
+    assert_eq!(node["electron"], DEFAULT_VERSION);
+    assert_eq!(node["nodeMode"], "1");
+    let main = electron.run(
+      "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,ready:require('electron').app.isReady(),electron:process.versions.electron}));const ignored={};ignored.self=ignored;return ignored;",
+    ).timeout(WAIT).await.unwrap();
     assert!(main.status.success(), "{main:?}");
     assert!(main.stderr.is_empty());
     let main: Value = serde_json::from_slice(&main.stdout).unwrap();
     assert!(main["pid"].as_u64().unwrap() > 0);
-    assert_eq!(main["pid"], worker["pid"]);
+    assert_ne!(main["pid"], node["pid"]);
     assert_eq!(main["isMainThread"], true);
     assert_eq!(main["threadId"], 0);
     assert_eq!(main["ready"], true);
     assert_eq!(main["electron"], DEFAULT_VERSION);
-    let version = electron.electron(&["--version"]).timeout(WAIT).await.unwrap();
+    let version = electron_rs::electron(binary, &["--version"]).unwrap();
     assert!(version.status.success(), "{version:?}");
     assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), format!("v{DEFAULT_VERSION}"));
-    let printed = electron.node(&["-p", "6 * 7"]).timeout(WAIT).await.unwrap();
+    let printed = electron.node(&["-p", "6 * 7"]).unwrap();
     assert!(printed.status.success(), "{printed:?}");
     assert_eq!(printed.stdout, b"42\n");
-    // Both commands deliberately omit .timeout() and exceed normal RPC's 5s deadline.
-    let delayed = "(async()=>{await new Promise(resolve=>setTimeout(resolve,5100));process.stdout.write('unlimited');return 1n;})()";
-    let (delayed_worker, delayed_main) = tokio::time::timeout(WAIT, async {
-      tokio::join!(
-        async { electron.node(&["-e", delayed]).await },
-        async { electron.electron(&["-e", delayed]).await },
-      )
-    }).await.expect("default commands must finish without a response deadline");
-    for output in [delayed_worker.unwrap(), delayed_main.unwrap()] {
-      assert!(output.status.success(), "{output:?}");
-      assert_eq!(output.stdout, b"unlimited");
-      assert!(output.stderr.is_empty());
-    }
-    for electron_mode in [false, true] {
-      let script = "if(process.argv[1]!=='argument with spaces'||process.argv[2]!=='雪 🦀')throw new Error('arguments changed');process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));1n;";
-      let args = &["-e", script, "--", "argument with spaces", "雪 🦀"];
-      let command = if electron_mode { electron.electron(args) }
-        else { electron.node(args) };
-      let output = command.timeout(WAIT).max_output_bytes(64).await.unwrap();
-      assert!(output.status.success(), "{output:?}");
-      assert_eq!(output.stdout, oracle.stdout);
-      assert_eq!(output.stderr, oracle.stderr);
-    }
-    let failed = electron.node(&["-e", "process.exit(17)"]).timeout(WAIT).await.unwrap();
+    // Deliberately omit .timeout() and exceed normal RPC's 5s deadline.
+    let output = tokio::time::timeout(WAIT, electron.run(
+      "await new Promise(resolve=>setTimeout(resolve,5100));process.stdout.write('unlimited');return 1n;",
+    )).await.unwrap().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"unlimited");
+    assert!(output.stderr.is_empty());
+    let node = electron.node(&["-e", "if(process.argv[1]!=='argument with spaces'||process.argv[2]!=='雪 🦀')throw new Error('arguments changed');process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));", "--", "argument with spaces", "雪 🦀"]).unwrap();
+    assert!(node.status.success(), "{node:?}");
+    assert_eq!(node.stdout, oracle.stdout);
+    assert_eq!(node.stderr, oracle.stderr);
+    let output = electron.run("process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));return 1n;")
+      .timeout(WAIT).max_output_bytes(64).await.unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, oracle.stdout);
+    assert_eq!(output.stderr, oracle.stderr);
+    let failed = electron.node(&["-e", "process.exit(17)"]).unwrap();
     assert_eq!(failed.status.code(), Some(17));
     assert!(failed.stdout.is_empty() && failed.stderr.is_empty());
-    let failed = electron.electron(&["-e", "process.exitCode=23;"])
+    let failed = electron.run("process.exitCode=23;return {scoped:true};")
       .timeout(WAIT).await.unwrap();
     assert_eq!(failed.status.code(), Some(23));
 
     let first = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&first);
     let (chunks, received) = mpsc::channel();
-    let mut pending = electron.electron(&["-e",
-      "(async()=>{console.log('live stdout');console.error('live stderr');await new Promise(resolve=>setTimeout(resolve,1000));console.log('last stdout');console.error('last stderr');return {answer:42};})()",
-    ]).timeout(WAIT).max_output_bytes(1024).on_output(move |chunk| {
+    let mut pending = electron.run(
+      "console.log('live stdout');console.error('live stderr');await new Promise(resolve=>setTimeout(resolve,1000));console.log('last stdout');console.error('last stderr');return {answer:42};",
+    ).timeout(WAIT).max_output_bytes(1024).on_output(move |chunk| {
       chunks.send(chunk).unwrap();
       observed.store(true, Ordering::SeqCst);
     }).into_future();
@@ -505,12 +499,12 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     }
     assert_eq!(stdout, output.stdout);
     assert_eq!(stderr, output.stderr);
-    let timed_out = electron.electron(&["-e", "new Promise(()=>{})"])
+    let timed_out = electron.run("await new Promise(()=>{});")
       .timeout(Duration::from_millis(100)).await.unwrap();
     assert_eq!(timed_out.status.code(), Some(124));
-    let healthy = electron.electron(&["-e",
+    let healthy = electron.run(
       "console.log(JSON.stringify({pid:process.pid,ready:require('electron').app.isReady(),code:process.exitCode??0}));",
-    ]).timeout(WAIT).await.unwrap();
+    ).timeout(WAIT).await.unwrap();
     assert!(healthy.status.success(), "{healthy:?}");
     assert!(healthy.stderr.is_empty());
     let healthy: Value = serde_json::from_slice(&healthy.stdout).unwrap();

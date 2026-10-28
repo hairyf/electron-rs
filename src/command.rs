@@ -35,35 +35,29 @@ pub struct CommandChunk {
   pub data: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Mode { Node, Electron }
-
 type OutputCallback = Box<dyn FnMut(CommandChunk) + Send + 'static>;
 
-/// An owned CLI invocation in the connected Electron process. Awaiting starts it.
+/// An owned script on the connected Electron main thread. Awaiting starts it.
 ///
-/// Accepts CLI arguments such as `-e`, `-p`, `--version` or a CommonJS entry path.
-/// Unsupported startup switches and stdin/REPL modes are rejected. Defaults are
-/// no deadline and 16 MiB of combined stdout/stderr. Dropping its pending future
-/// cancels it best effort on the current Tokio runtime. Awaiting yields task
-/// status and raw output in [`Output`]; it never starts a separate process.
+/// The async function body receives `signal`, `require`, `process` and `console`.
+/// Defaults are no deadline and 16 MiB of combined stdout/stderr. Dropping its
+/// pending future cancels it best effort on the current Tokio runtime. Script
+/// return values are ignored; awaiting yields task status and raw output in
+/// [`Output`]. Main-thread cancellation cannot interrupt synchronous JavaScript.
 #[must_use = "await the command to execute it"]
 pub struct Command {
   electron: Arc<Electron>,
-  mode: Mode,
-  args: Vec<String>,
+  script: String,
   timeout: Option<Duration>,
   max_output_bytes: usize,
   on_output: Option<OutputCallback>,
 }
 
 impl Command {
-  pub(crate) fn new(electron: Arc<Electron>, mode: Mode, args: &[&str]) -> Self {
+  pub(crate) fn new(electron: Arc<Electron>, script: &str) -> Self {
     Self {
       electron,
-      mode,
-      args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+      script: script.to_owned(),
       timeout: None,
       max_output_bytes: DEFAULT_OUTPUT_BYTES,
       on_output: None,
@@ -84,7 +78,7 @@ impl Command {
   pub fn max_output_bytes(mut self, bytes: usize) -> Self { self.max_output_bytes = bytes; self }
 
   async fn execute(self) -> Result<Output, Error> {
-    let Self { electron, mode, args, timeout, max_output_bytes, mut on_output } = self;
+    let Self { electron, script, timeout, max_output_bytes, mut on_output } = self;
     let timeout_ms = timeout.map(timeout_millis).transpose()?;
     if !(1..=MAX_OUTPUT_BYTES).contains(&max_output_bytes) {
       return Err("command max_output_bytes must be between 1 byte and 256 MiB".into());
@@ -97,7 +91,7 @@ impl Command {
     electron.register_command(task_id.clone(), route)?;
     let mut guard = CommandGuard { electron: Arc::clone(&electron), task_id: task_id.clone(), cancel: true };
     let response = electron.call_with_timeout(Execute {
-      task_id, mode, args, timeout_ms, max_output_bytes, stream,
+      task_id, script, timeout_ms, max_output_bytes, stream,
     }, timeout.map(|timeout| timeout + RESPONSE_GRACE));
     tokio::pin!(response);
     let mut captured = CapturedOutput::default();
@@ -152,8 +146,7 @@ fn timeout_millis(timeout: Duration) -> Result<u64, Error> {
 #[serde(rename_all = "camelCase")]
 struct Execute {
   task_id: String,
-  mode: Mode,
-  args: Vec<String>,
+  script: String,
   timeout_ms: Option<u64>,
   max_output_bytes: usize,
   stream: bool,
