@@ -35,7 +35,9 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`DEFAULT_VERSION` is `45.0.0`. `build()` returns a `PreparedDistribution` with absolute `directory` and `binary` paths — bundle the whole directory. Building may download the release or reuse a local cache; runtime discovery never downloads or repairs.
+- `DEFAULT_VERSION` is `45.0.0`
+- `build()` returns a `PreparedDistribution` with absolute `directory` and `binary` paths — bundle the whole directory
+- building may download the release or reuse a local cache; runtime discovery never downloads or repairs
 
 ## Run
 
@@ -58,9 +60,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-`electron_binary!(None)` reads the consuming crate's compile-time `APP_ELECTRON_BINARY`, normally set by its build script; a macro is required because a function cannot see a consumer's compile-time environment. `Some(path)` and `electron_binary(path)` take an executable, distribution directory, or resource root without it. Neither downloads, modifies, or reads the runtime environment.
-
-`Electron::new` launches the bridge. `events()` takes the initial receiver once; `on()`/`subscribe()` cover later events. Built-in requests live in `electron_rs::rpc::{app, window, webview, protocol}`; implement `RpcRequest` only for extensions.
+- `electron_binary!(None)` reads the calling crate's compile-time `APP_ELECTRON_BINARY`, normally from its build script; the macro is required because a function cannot see a consumer's compile-time environment
+- `Some(path)` and `electron_binary(path)` take an executable, distribution directory, or resource root, without that variable and without downloading or reading the runtime environment
+- `Electron::new` launches the bridge; `events()` yields the initial receiver once, `on()`/`subscribe()` cover later events
+- built-in requests live in `electron_rs::rpc::{app, window, webview, protocol}`; implement `RpcRequest` only for extensions
 
 ## JavaScript and processes
 
@@ -73,7 +76,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ### Node mode
 
-`client.node(args)` is `node(client.binary, args)`: `Command::spawn()` with `ELECTRON_RUN_AS_NODE=1`, null stdin, piped output, `kill_on_drop(true)` — no wrapper, RPC, or Worker. Needs a Tokio runtime with I/O enabled (`enable_all()` when manual).
+`client.node(args)` is `node(client.binary, args)`:
 
 ```rust
 let output = client.node(&["-p", "process.versions.node"])?
@@ -81,7 +84,7 @@ let output = client.node(&["-p", "process.versions.node"])?
 assert!(output.status.success());
 ```
 
-For live output and explicit cancellation, keep the native child:
+Live output and explicit cancellation, from the native child:
 
 ```rust
 use tokio::io::AsyncReadExt;
@@ -94,10 +97,9 @@ assert_eq!(&ready, b"ready");
 child.kill().await?; // Terminates and waits for the direct child.
 ```
 
-No timeout or buffering is imposed: pair `tokio::time::timeout` with `child.kill().await`, and drain both pipes (or `wait_with_output()`, which buffers). Kill-on-drop is not a process-tree manager.
-
-> [!NOTE]
-> With the `RunAsNode` fuse the child enters `NodeMain` without the browser stack, but still loads Electron's V8/ICU: native Node restrictions apply and memory parity with standalone Node is not guaranteed.
+- plain Tokio `Command::spawn()` with `ELECTRON_RUN_AS_NODE=1`, null stdin, piped output, `kill_on_drop(true)` — no wrapper, RPC, or Worker; needs a Tokio runtime with I/O enabled (`enable_all()` when manual)
+- no timeout or buffering imposed: pair `tokio::time::timeout` with `child.kill().await`, drain both pipes (or `wait_with_output()`, which buffers); kill-on-drop is not a process-tree manager
+- `RunAsNode` fuse: the child enters `NodeMain` without the browser stack but still loads Electron's V8/ICU — native Node restrictions apply, and memory parity with standalone Node is not guaranteed
 
 ### `client.run(script)`
 
@@ -116,17 +118,11 @@ let output = client.run(r#"
 assert!(output.status.success());
 ```
 
-The body gets `signal`, `require`, `process`, and `console`, supports top-level `await`/`return`, and has no `args`. Returns are ignored; `process.exit` ends the task, not the host. No default deadline — `.timeout(...)`, `.max_output_bytes(...)` (16 MiB), and `.on_output(...)` are per call. Globals stay shared: a trusted Rust-side API, not a sandbox, whose cancellation cannot interrupt synchronous JavaScript.
+- body gets `signal`, `require`, `process`, `console`, top-level `await`/`return`, no `args`; returns are ignored, and `process.exit` ends the task, not the host
+- no default deadline; `.timeout(...)`, `.max_output_bytes(...)` (16 MiB), and `.on_output(...)` are per call
+- globals stay shared — a trusted Rust-side API, not a sandbox — and cancellation cannot interrupt synchronous JavaScript
 
-`electron(binary, args)` is the blocking counterpart: clears `ELECTRON_RUN_AS_NODE`, waits, and returns `Output` (use `spawn_blocking` in async code). Neither connects to the RPC bridge; `ElectronBuilder::node`/`electron` wrap them for a prepared distribution.
-
-## API
-
-- `ElectronBuilder`, `Metadata`: acquisition, output paths, resources, `.ico`/`.icns` branding
-- `PreparedDistribution`, `electron_binary!`/`electron_binary(path)`: the staged paths to bundle or launch
-- `Electron`: typed `call`, events, subscriptions, `run(script)`, `node(args)`, `shutdown`
-
-See the [Rust source](src/lib.rs), [bundled bridge](assets/main.cjs), [examples](example/), and [integration tests](tests/).
+`electron(binary, args)` is the blocking counterpart: clears `ELECTRON_RUN_AS_NODE`, waits, returns `Output` (use `spawn_blocking` in async code). Neither connects to the RPC bridge; `ElectronBuilder::node`/`electron` wrap them for a prepared distribution.
 
 ## Examples
 
@@ -152,6 +148,6 @@ pnpm test
 
 CI runs on Windows, macOS, and Linux. The ignored [real bridge tests](tests/bridge.rs) need `pnpm run test:bridge:prepare` and `pnpm run test:bridge` with a desktop/display. Linux supports `app_name` branding only; Windows/macOS branding needs the matching host, signed afterward.
 
-The Tauri adapter lives in the separate [tauri-runtime-electron](https://github.com/hairyf/tauri-runtime-electron) project.
+See the [Rust source](src/lib.rs), [bundled bridge](assets/main.cjs), [examples](example/), and [integration tests](tests/). The Tauri adapter lives in the separate [tauri-runtime-electron](https://github.com/hairyf/tauri-runtime-electron) project.
 
 [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE-2.0).
