@@ -225,7 +225,8 @@ fn prepare_bridge() {
   let source = ElectronBuilder::new(DEFAULT_VERSION)
     .path(&runtime)
     .output(resources.join(format!("{}-{}", platform(), arch())))
-    .metadata(metadata.clone());
+    .metadata(metadata.clone())
+    .pe(true);
   let source = source
     .build()
     .expect("stage actual DEFAULT_VERSION from the runtime root/cache (or acquire it)");
@@ -241,7 +242,8 @@ fn prepare_bridge() {
     .path(format!("{{resources}}/{}-{}", platform(), arch()))
     .resources_dir(&resources)
     .output(distribution())
-    .metadata(metadata);
+    .metadata(metadata)
+    .pe(true);
   let prepared = builder
     .build()
     .expect("copy the real prepared distribution through {resources}");

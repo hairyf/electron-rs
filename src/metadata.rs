@@ -17,13 +17,14 @@ use std::process::Command;
 
 /// Validate runtime identity fields using the current target.
 pub(crate) fn validate(metadata: &Metadata) -> Result<(), Error> {
-  validate_for(metadata, &DistributionTarget::current()?)
+  validate_for(metadata, &DistributionTarget::current()?, true)
 }
 
 /// Validate build-time metadata before using it as a file or process name.
-pub(crate) fn validate_for(metadata: &Metadata, target: &DistributionTarget) -> Result<(), Error> {
+pub(crate) fn validate_for(metadata: &Metadata, target: &DistributionTarget, pe: bool) -> Result<(), Error> {
   if let Some(name) = metadata.app_name.as_deref() { validate_name(name)?; }
   if let Some(identifier) = metadata.identifier.as_deref() { validate_identifier(identifier)?; }
+  if !pe { return Ok(()); }
   for (label, path) in [("icon", metadata.icon.as_deref()), ("host executable", metadata.host_executable.as_deref())] {
     if let Some(path) = path {
       let file = fs::metadata(path).map_err(|error| Error::with_source(format!("inspect {label} {}", path.display()), error))?;
@@ -64,29 +65,41 @@ fn has_branding(metadata: &Metadata) -> bool {
 }
 
 /// Compare branding and identity; executable headers remain authoritative.
-pub(crate) fn matches(dist: &Path, metadata: &Metadata, target: &DistributionTarget, version: &str) -> Result<bool, Error> {
+pub(crate) fn matches(dist: &Path, metadata: &Metadata, target: &DistributionTarget, version: &str, pe: bool) -> Result<bool, Error> {
   let Ok(value) = read_marker(&dist.join(MARKER)) else { return Ok(false) };
   if value.get("version").and_then(serde_json::Value::as_u64) != Some(MARKER_VERSION as u64)
     || value.get("electronVersion").and_then(serde_json::Value::as_str) != Some(version)
+    || value.get("pe").and_then(serde_json::Value::as_bool).unwrap_or(true) != pe
   {
     return Ok(false);
   }
+  if !pe && value.get("binary").and_then(serde_json::Value::as_str) != Some(target.executable()) { return Ok(false); }
   if marker_binary(dist, &value, target).ok().flatten().is_none() { return Ok(false); }
   Ok(value.get("appName") == Some(&serde_json::json!(metadata.app_name))
     && value.get("identifier") == Some(&serde_json::json!(metadata.identifier))
-    && value.get("fingerprint").and_then(serde_json::Value::as_str) == Some(fingerprint(metadata, target)?.as_str()))
+    && value.get("fingerprint").and_then(serde_json::Value::as_str) == Some(fingerprint(metadata, target, pe)?.as_str()))
+}
+
+/// Only new stock markers can prove that a prepared binary was never branded.
+/// Legacy markers are still readable at runtime, but cannot seed a stock build.
+pub(crate) fn is_stock(dist: &Path, target: &DistributionTarget) -> Result<bool, Error> {
+  if !dist.join(MARKER).exists() { return Ok(target.verify_binary(&dist.join(target.executable())).is_ok()); }
+  let Ok(value) = read_marker(&dist.join(MARKER)) else { return Ok(false) };
+  Ok(value.get("pe").and_then(serde_json::Value::as_bool) == Some(false)
+    && value.get("binary").and_then(serde_json::Value::as_str) == Some(target.executable())
+    && marker_binary(dist, &value, target)?.is_some())
 }
 
 /// Apply branding and persist verified identity only in the private stage.
-pub(crate) fn apply(dist: &Path, metadata: &Metadata, target: &DistributionTarget, version: &str) -> Result<(), Error> {
-  validate_for(metadata, target)?;
-  if matches(dist, metadata, target, version)? { return Ok(()); }
+pub(crate) fn apply(dist: &Path, metadata: &Metadata, target: &DistributionTarget, version: &str, pe: bool) -> Result<(), Error> {
+  validate_for(metadata, target, pe)?;
+  if matches(dist, metadata, target, version, pe)? { return Ok(()); }
   binary_for(dist, None, target)?;
   let marker = dist.join(MARKER);
   if marker.exists() {
     fs::remove_file(&marker).map_err(|error| Error::with_source(format!("remove stale {}", marker.display()), error))?;
   }
-  let binary = if has_branding(metadata) {
+  let binary = if pe && has_branding(metadata) {
     match target.platform {
       "win32" => apply_windows(dist, metadata)?,
       "darwin" => apply_macos(dist, metadata)?,
@@ -105,7 +118,8 @@ pub(crate) fn apply(dist: &Path, metadata: &Metadata, target: &DistributionTarge
     "appName": metadata.app_name,
     "identifier": metadata.identifier,
     "binary": relative,
-    "fingerprint": fingerprint(metadata, target)?,
+    "fingerprint": fingerprint(metadata, target, pe)?,
+    "pe": pe,
   });
   let temporary = marker.with_extension("json.tmp");
   let bytes = serde_json::to_vec(&marker_value)?;
@@ -294,7 +308,7 @@ fn relative_marker_path(dist: &Path, binary: &Path) -> Result<String, Error> {
   Ok(relative)
 }
 
-fn fingerprint(metadata: &Metadata, target: &DistributionTarget) -> Result<String, Error> {
+fn fingerprint(metadata: &Metadata, target: &DistributionTarget, pe: bool) -> Result<String, Error> {
   let mut hasher = DefaultHasher::new();
   target.platform.hash(&mut hasher);
   target.arch.hash(&mut hasher);
@@ -302,9 +316,11 @@ fn fingerprint(metadata: &Metadata, target: &DistributionTarget) -> Result<Strin
   metadata.identifier.hash(&mut hasher);
   for (tag, path) in [(b"icon".as_slice(), metadata.icon.as_deref()), (b"host".as_slice(), metadata.host_executable.as_deref())] {
     tag.hash(&mut hasher);
-    if let Some(path) = path {
-      path.to_string_lossy().hash(&mut hasher);
-      hash_file(path, &mut hasher)?;
+    if pe {
+      if let Some(path) = path {
+        path.to_string_lossy().hash(&mut hasher);
+        hash_file(path, &mut hasher)?;
+      }
     }
   }
   Ok(format!("{:016x}", hasher.finish()))
@@ -433,9 +449,9 @@ mod tests {
     let executable = root.join(target.executable());
     fs::write(&executable, crate::acquisition::test_binary(&target)).unwrap();
     let metadata = Metadata::default();
-    apply(&root, &metadata, &target, crate::DEFAULT_VERSION).unwrap();
-    assert!(matches(&root, &metadata, &target, crate::DEFAULT_VERSION).unwrap());
-    assert!(!matches(&root, &metadata, &target, "44.0.0").unwrap());
+    apply(&root, &metadata, &target, crate::DEFAULT_VERSION, true).unwrap();
+    assert!(matches(&root, &metadata, &target, crate::DEFAULT_VERSION, true).unwrap());
+    assert!(!matches(&root, &metadata, &target, "44.0.0", true).unwrap());
     let marker = root.join(MARKER);
     let mut value = read_marker(&marker).unwrap();
     value["arch"] = serde_json::json!(other.arch);
@@ -445,13 +461,48 @@ mod tests {
     fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
     fs::write(&executable, crate::acquisition::test_binary(&other)).unwrap();
     assert!(binary_for(&root, None, &target).is_err());
-    assert!(!matches(&root, &metadata, &target, crate::DEFAULT_VERSION).unwrap());
+    assert!(!matches(&root, &metadata, &target, crate::DEFAULT_VERSION, true).unwrap());
     fs::write(&executable, crate::acquisition::test_binary(&target)).unwrap();
     value["version"] = serde_json::json!(1);
     value.as_object_mut().unwrap().remove("arch");
     fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
     assert_eq!(binary_for(&root, None, &target).unwrap(), executable);
-    assert!(!matches(&root, &metadata, &target, crate::DEFAULT_VERSION).unwrap());
+    assert!(!matches(&root, &metadata, &target, crate::DEFAULT_VERSION, true).unwrap());
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn pe_controls_native_names_without_changing_runtime_identity() {
+    let root = crate::acquisition::unique_sibling(&Path::new(env!("CARGO_MANIFEST_DIR")).join("target/electron-pe-marker"), "test");
+    let target = DistributionTarget::from_triple("x86_64-unknown-linux-gnu").unwrap();
+    fs::create_dir_all(&root).unwrap();
+    let stock = root.join(target.executable());
+    let bytes = crate::acquisition::test_binary(&target);
+    fs::write(&stock, &bytes).unwrap();
+    let metadata = Metadata { app_name: Some("My App".into()), ..Metadata::default() };
+    apply(&root, &metadata, &target, crate::DEFAULT_VERSION, false).unwrap();
+    assert!(is_stock(&root, &target).unwrap());
+    assert!(matches(&root, &metadata, &target, crate::DEFAULT_VERSION, false).unwrap());
+    assert!(!matches(&root, &metadata, &target, crate::DEFAULT_VERSION, true).unwrap());
+    let runtime_identity = read_marker(&root.join(MARKER)).unwrap();
+    assert_eq!(binary_for(&root, Some("My App"), &target).unwrap(), stock);
+    assert_eq!(fs::read(&stock).unwrap(), bytes);
+
+    apply(&root, &metadata, &target, crate::DEFAULT_VERSION, true).unwrap();
+    assert!(!stock.exists());
+    assert!(!is_stock(&root, &target).unwrap());
+    let branded = root.join("My App");
+    assert_eq!(binary_for(&root, None, &target).unwrap(), branded);
+    let marker_path = root.join(MARKER);
+    let mut marker = read_marker(&marker_path).unwrap();
+    for key in ["appName", "identifier"] { assert_eq!(marker[key], runtime_identity[key]); }
+    // Old markers must remain readable, but must never qualify as stock sources.
+    marker.as_object_mut().unwrap().remove("pe");
+    fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    assert!(matches(&root, &metadata, &target, crate::DEFAULT_VERSION, true).unwrap());
+    assert!(!matches(&root, &metadata, &target, crate::DEFAULT_VERSION, false).unwrap());
+    assert!(!is_stock(&root, &target).unwrap());
+    assert_eq!(binary_for(&root, None, &target).unwrap(), branded);
     fs::remove_dir_all(root).unwrap();
   }
 

@@ -61,11 +61,12 @@ pub struct ElectronBuilder {
   output: Option<PathBuf>,
   resources: Option<PathBuf>,
   metadata: Metadata,
+  pe: Option<bool>,
 }
 
 impl ElectronBuilder {
   pub fn new(version: impl Into<String>) -> Self {
-    Self { version: version.into(), paths: Vec::new(), output: None, resources: None, metadata: Metadata::default() }
+    Self { version: version.into(), paths: Vec::new(), output: None, resources: None, metadata: Metadata::default(), pe: None }
   }
 
   /// Add an ordered search path, optionally beginning with `{resources}`.
@@ -84,6 +85,21 @@ impl ElectronBuilder {
   pub fn host_executable(mut self, path: impl Into<PathBuf>) -> Self { self.metadata.host_executable = Some(path.into()); self }
   /// Replace all branding settings; individual fluent setters can override them.
   pub fn metadata(mut self, metadata: Metadata) -> Self { self.metadata = metadata; self }
+  /// Enable native branding (metadata, executable renaming and Windows PE edits).
+  /// Defaults to off for Cargo's development profile and on for release builds.
+  /// Outside build scripts, defaults to `!cfg!(debug_assertions)`. An explicit
+  /// value overrides the profile, regardless of the order of metadata setters.
+  /// With `false`, the executable's native metadata and filename stay stock.
+  /// Runtime identity, bridge assets and distribution markers are unchanged.
+  pub fn pe(mut self, enabled: bool) -> Self { self.pe = Some(enabled); self }
+
+  fn pe_enabled(&self) -> bool {
+    self.pe.unwrap_or_else(|| match std::env::var("PROFILE").as_deref() {
+      Ok("debug") => false,
+      Ok("release") => true,
+      _ => !cfg!(debug_assertions),
+    })
+  }
 
   /// Prepare and publish a private distribution and its embedded scripts.
   ///
@@ -95,7 +111,9 @@ impl ElectronBuilder {
   pub fn build(&self) -> Result<PreparedDistribution, Error> {
     validate_version(&self.version)?;
     let target = DistributionTarget::current()?;
-    metadata::validate_for(&self.metadata, &target)?;
+    let pe = self.pe_enabled();
+    let metadata = &self.metadata;
+    metadata::validate_for(metadata, &target, pe)?;
     let output = acquisition::output_directory(self.output.as_deref(), &target)?;
     let parent = output.parent().ok_or("Electron output has no parent")?;
     fs::create_dir_all(parent).map_err(|error| Error::with_source(format!("create {}", parent.display()), error))?;
@@ -103,7 +121,7 @@ impl ElectronBuilder {
       .map_err(|error| Error::with_source(format!("resolve {}", parent.display()), error))?
       .join(output.file_name().ok_or("Electron output has no directory name")?);
     let existing = compatible_distribution(&output, &self.version, &target).is_ok();
-    let reusable = existing && metadata::matches(&output, &self.metadata, &target, &self.version)?;
+    let reusable = existing && metadata::matches(&output, metadata, &target, &self.version, pe)?;
     if reusable && assets_match(&output, &target) {
       let binary = metadata::binary_for(&output, None, &target)?;
       return Ok(PreparedDistribution { directory: output, binary, cleanup_warning: None });
@@ -115,19 +133,22 @@ impl ElectronBuilder {
       let mut candidates = self.paths.iter().map(|path| self.expand_resources(path)).collect::<Result<Vec<_>, _>>()?;
       let cwd = std::env::current_dir().map_err(|error| Error::with_source("resolve current directory", error))?;
       if let Some(path) = acquisition::local_install(&cwd, &target) { candidates.push(path); }
-      // A verified, unbranded output can seed its first metadata application.
-      if existing && !output.join("electron-rs.json").exists() { candidates.push(output.clone()); }
+      // Stock output can seed metadata changes, including enabling native branding.
+      if existing && metadata::is_stock(&output, &target)? { candidates.push(output.clone()); }
       if let Some(path) = acquisition::cached_dist(&self.version, &target) { candidates.push(path); }
       let mut source = None;
       for path in candidates {
         let Ok(dir) = compatible_distribution(&path, &self.version, &target) else { continue };
-        if !dir.join("electron-rs.json").exists() || metadata::matches(&dir, &self.metadata, &target, &self.version)? {
+        if metadata::is_stock(&dir, &target)? || metadata::matches(&dir, metadata, &target, &self.version, pe)? {
           source = Some(dir);
           break;
         }
       }
       match source { Some(source) => source, None => acquisition::download(&self.version, &target)? }
     };
+    if !metadata::is_stock(&source, &target)? && !metadata::matches(&source, metadata, &target, &self.version, pe)? {
+      return Err(format!("Electron source {} has incompatible branding; supply a stock distribution", source.display()).into());
+    }
     let source = fs::canonicalize(&source)
       .map_err(|error| Error::with_source(format!("resolve {}", source.display()), error))?;
     if source != canonical_output && (source.starts_with(&canonical_output) || canonical_output.starts_with(&source)) {
@@ -141,11 +162,11 @@ impl ElectronBuilder {
       acquisition::copy_dir(&source, &stage)?;
       write_assets(&stage)?;
       compile_native_assets(&stage, &target)?;
-      metadata::apply(&stage, &self.metadata, &target, &self.version)?;
+      metadata::apply(&stage, metadata, &target, &self.version, pe)?;
       let version_path = stage.join(".electron-rs-version");
       fs::write(&version_path, &self.version)
         .map_err(|error| Error::with_source(format!("write {}", version_path.display()), error))?;
-      let staged_binary = metadata::binary_for(&stage, self.metadata.app_name.as_deref(), &target)?;
+      let staged_binary = metadata::binary_for(&stage, None, &target)?;
       let relative = staged_binary.strip_prefix(&stage)
         .map_err(|error| Error::with_source("prepared binary is outside staging", error))?;
       let binary = output.join(relative);
@@ -166,7 +187,12 @@ impl ElectronBuilder {
   pub fn binary(&self) -> Result<PathBuf, Error> {
     let target = DistributionTarget::current()?;
     let directory = acquisition::output_directory(self.output.as_deref(), &target)?;
-    metadata::binary_for(&directory, self.metadata.app_name.as_deref(), &target)
+    let pe = self.pe_enabled();
+    if !pe && !metadata::is_stock(&directory, &target)? {
+      return Err("prepared Electron is not stock; call build() with pe(false) before resolving the binary".into());
+    }
+    let name = if pe { self.metadata.app_name.as_deref() } else { None };
+    metadata::binary_for(&directory, name, &target)
   }
 
   /// Resolve the output root in the current Cargo context without writing.
@@ -369,6 +395,85 @@ fn run_command(binary: &Path, args: &[&str]) -> io::Result<Output> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn builder_pe_respects_consumer_profile_and_explicit_overrides() {
+    const WORKER: &str = "ELECTRON_RS_PE_PROFILE_TEST";
+    if let Ok(expected) = std::env::var(WORKER) {
+      let builder = ElectronBuilder::new(DEFAULT_VERSION);
+      assert_eq!(builder.pe_enabled(), expected == "true");
+      for enabled in [false, true] {
+        assert_eq!(builder.clone().pe(enabled).app_name("My App").metadata(Metadata::default()).pe_enabled(), enabled);
+        assert_eq!(builder.clone().app_name("My App").pe(enabled).pe_enabled(), enabled);
+      }
+      return;
+    }
+    for (profile, expected) in [(Some("debug"), false), (Some("release"), true), (None, !cfg!(debug_assertions)), (Some("custom"), !cfg!(debug_assertions))] {
+      let mut command = ProcessCommand::new(std::env::current_exe().unwrap());
+      command.args(["--exact", "tests::builder_pe_respects_consumer_profile_and_explicit_overrides", "--nocapture"])
+        .env(WORKER, expected.to_string());
+      match profile { Some(profile) => { command.env("PROFILE", profile); }, None => { command.env_remove("PROFILE"); } }
+      let output = command.output().unwrap();
+      assert!(output.status.success(), "profile {profile:?}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+  }
+
+  #[test]
+  fn pe_false_restores_stock_bytes_and_preserves_runtime_identity() {
+    let root = acquisition::unique_sibling(&Path::new(env!("CARGO_MANIFEST_DIR")).join("target/electron-pe"), "test");
+    let source = root.join("source");
+    let output = root.join("output");
+    let target = DistributionTarget::current().unwrap();
+    let stock = source.join(target.executable());
+    let bytes = acquisition::test_binary(&target);
+    fs::create_dir_all(stock.parent().unwrap()).unwrap();
+    fs::write(&stock, &bytes).unwrap();
+    fs::write(source.join("version"), DEFAULT_VERSION).unwrap();
+    let builder = ElectronBuilder::new(DEFAULT_VERSION).path(&source).output(&output).pe(false)
+      .app_name("My App").identifier("com.example.app").icon(root.join("missing.ico"))
+      .host_executable(root.join("missing.exe"));
+    let prepared = builder.build().unwrap();
+    assert_eq!(prepared.binary, output.join(target.executable()));
+    assert_eq!(builder.binary().unwrap(), prepared.binary);
+    assert_eq!(fs::read(&prepared.binary).unwrap(), bytes);
+
+    // Model a previously branded output without patching or executing a real binary.
+    let marker_path = output.join("electron-rs.json");
+    let mut marker: serde_json::Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    let branded = output.join("previous-branded-binary");
+    fs::rename(&prepared.binary, &branded).unwrap();
+    let mut branded_bytes = bytes.clone();
+    branded_bytes.extend_from_slice(b"old branding");
+    fs::write(&branded, &branded_bytes).unwrap();
+    marker["binary"] = serde_json::json!("previous-branded-binary");
+    marker["appName"] = serde_json::json!("Previous App");
+    marker["pe"] = serde_json::json!(true);
+    fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    assert!(builder.binary().unwrap_err().to_string().contains("call build()"));
+    let restored = builder.build().unwrap();
+    assert_eq!(fs::read(&restored.binary).unwrap(), bytes);
+    assert!(!branded.exists());
+    assert_eq!(builder.binary().unwrap(), restored.binary);
+    let marker: serde_json::Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    assert_eq!(marker["appName"], "My App");
+    assert_eq!(marker["identifier"], "com.example.app");
+    assert_eq!(marker["pe"], false);
+    let modified = fs::metadata(&restored.binary).unwrap().modified().unwrap();
+    builder.build().unwrap();
+    assert_eq!(fs::metadata(&restored.binary).unwrap().modified().unwrap(), modified);
+    assert!(builder.clone().pe(true).build().is_err(), "native icon inputs must still be validated when enabled");
+    assert_eq!(fs::read(&restored.binary).unwrap(), bytes);
+    // A stock output remains reusable when only runtime identity changes.
+    let mut changed = builder.clone().app_name("Another App");
+    changed.paths = vec![output.clone()];
+    let changed = changed.build().unwrap();
+    assert_eq!(changed.binary, restored.binary);
+    assert_eq!(fs::read(&changed.binary).unwrap(), bytes);
+    let marker: serde_json::Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    assert_eq!(marker["appName"], "Another App");
+    assert_eq!(fs::read(stock).unwrap(), bytes);
+    fs::remove_dir_all(root).unwrap();
+  }
 
   #[test]
   fn builder_refreshes_assets_and_resolves_the_existing_resource_mapping() {

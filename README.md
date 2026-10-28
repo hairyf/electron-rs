@@ -38,6 +38,17 @@ fn main() -> Result<(), Error> {
 - `DEFAULT_VERSION` is `45.0.0`
 - `build()` returns a `PreparedDistribution` with absolute `directory` and `binary` paths — bundle the whole directory
 - building may download the release or reuse a local cache; runtime discovery never downloads or repairs
+- native branding defaults to **off in development** (`PROFILE=debug`) and **on in production** (`PROFILE=release`), using the consuming Cargo build script's profile, not the build dependency's optimization level; outside build scripts it follows `!cfg!(debug_assertions)`
+- `.pe(true)` / `.pe(false)` explicitly overrides that default, regardless of metadata setter order; `false` disables executable/bundle renaming and native metadata/PE edits, and keeps the stock Electron executable. Icon and host-executable inputs are unused in that mode
+- **runtime behavior is unchanged**: `app_name` and `identifier` stay in the distribution marker and continue to drive the runtime name, identifier and profile ownership; bridge assets and distribution/version markers are still prepared
+- a previous branded output is replaced from a compatible stock source/cache, never renamed back or silently reused. Calling `binary()` with `.pe(false)` on a stale branded output fails until `build()` prepares it again
+
+```rust
+let prepared = ElectronBuilder::new(DEFAULT_VERSION)
+    .app_name("My App")
+    .pe(false) // Always use stock Electron, including release builds.
+    .build()?;
+```
 
 ## Run
 
