@@ -406,30 +406,19 @@ impl Electron {
       .map_err(|error| Error::with_source("Electron RPC writer failed", error))?
   }
 
-  /// Run this Electron binary in Node mode.
-  ///
-  /// Nonzero exits return `Ok(Output)`, preserving status, stdout, and stderr.
-  /// Only process creation or output collection failures return an I/O error.
-  pub fn node(&self, args: &[&str]) -> io::Result<std::process::Output> {
-    crate::node(&self.binary, args)
+  /// Run Node CLI arguments in a fresh Worker with this Electron process's PID.
+  /// Supports eval/print, version and CommonJS entries; no subprocess or REPL.
+  /// Startup-only switches are rejected. Await the builder to execute it.
+  pub fn node(self: &Arc<Self>, args: &[&str]) -> crate::Command {
+    crate::Command::new(Arc::clone(self), Mode::Node, args)
   }
 
-  /// Run this binary in Electron mode in a separate process, without an RPC bridge.
-  /// Clears `ELECTRON_RUN_AS_NODE`; nonzero exits return `Ok(Output)`.
-  pub fn electron(&self, args: &[&str]) -> io::Result<std::process::Output> {
-    crate::electron(&self.binary, args)
-  }
-
-  /// Run an owned async source body in this connection's shared main process.
-  /// The body receives `args` and `signal`; await the builder to execute it.
-  pub fn node_in_main(self: &Arc<Self>, script: &str, args: &[&str]) -> crate::Command {
-    crate::Command::new(Arc::clone(self), Mode::Node, script, args)
-  }
-
-  /// Run an owned async source body with Electron access in the shared main process.
-  /// The body receives `args` and `signal`; await the builder to execute it.
-  pub fn electron_in_main(self: &Arc<Self>, script: &str, args: &[&str]) -> crate::Command {
-    crate::Command::new(Arc::clone(self), Mode::Electron, script, args)
+  /// Run CLI arguments on the connected Electron main thread, with the same PID.
+  /// Supports eval/print, version and CommonJS entries with Electron APIs.
+  /// This is not a fresh app: startup-only switches are rejected, global/module
+  /// state is shared, and cancellation of synchronous code is cooperative.
+  pub fn electron(self: &Arc<Self>, args: &[&str]) -> crate::Command {
+    crate::Command::new(Arc::clone(self), Mode::Electron, args)
   }
 
   pub(crate) fn command_task_id(&self) -> Result<String, Error> {
@@ -779,6 +768,33 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn builtin_requests_round_trip_through_the_connected_client() {
+    use crate::{rpc::window::CursorPosition, SetTheme, Theme};
+    let (electron, peer, reader) = loopback(READY);
+    electron.start_reader(reader).unwrap();
+    let peer = std::thread::spawn(move || {
+      let mut reader = BufReader::new(peer);
+      for (method, params, deferred, result) in [
+        ("app.theme", json!({"theme":"system"}), true, Value::Null),
+        ("window.cursorPosition", json!({}), false, json!({"x":-12,"y":34})),
+      ] {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method);
+        assert_eq!(request["params"], params);
+        assert_eq!(request["asynchronous"].as_bool().unwrap_or(false), deferred);
+        writeln!(reader.get_mut(), "{}", json!({"id":request["id"],"result":result})).unwrap();
+      }
+      reader
+    });
+    electron.call(SetTheme { theme: Theme::System }).await.unwrap();
+    let position = electron.call(CursorPosition {}).await.unwrap();
+    assert_eq!((position.x, position.y), (-12, 34));
+    let _peer = peer.join().unwrap();
+  }
+
+  #[tokio::test]
   async fn shared_main_streams_owned_bytes_before_completion_and_survives_final_disconnect() {
     use std::future::IntoFuture as _;
     let (electron, peer, reader) = loopback(READY);
@@ -793,8 +809,8 @@ mod tests {
       let params = &request["params"];
       assert!(params["taskId"].is_string());
       assert_eq!(params["mode"], "node");
-      assert_eq!(params["script"], "return args[0]");
-      assert_eq!(params["args"], json!(["owned argument"]));
+      assert!(params.get("script").is_none());
+      assert_eq!(params["args"], json!(["-p", "process.argv[1]", "--", "owned argument"]));
       assert_eq!(params.get("timeoutMs"), Some(&Value::Null));
       assert_eq!(params["maxOutputBytes"], 16 * 1024 * 1024);
       assert_eq!(params["stream"], true);
@@ -811,9 +827,9 @@ mod tests {
       reader.get_ref().shutdown(Shutdown::Both).unwrap();
     });
     let command = {
-      let script = String::from("return args[0]");
+      let script = String::from("process.argv[1]");
       let arg = String::from("owned argument");
-      electron.node_in_main(&script, &[&arg])
+      electron.node(&["-p", &script, "--", &arg])
     };
     let (chunks, received) = mpsc::channel();
     let future = command.on_output(move |chunk| chunks.send(chunk).unwrap()).into_future();
@@ -853,7 +869,7 @@ mod tests {
       }})).unwrap();
       reader
     });
-    let mut command = electron.node_in_main("await new Promise(() => {})", &[]).into_future();
+    let mut command = electron.node(&["-e", "new Promise(() => {})"]).into_future();
     tokio::select! {
       result = &mut command => panic!("command unexpectedly completed: {result:?}"),
       received = received => received.unwrap(),
@@ -893,7 +909,7 @@ mod tests {
       reader
     });
     let started = Instant::now();
-    let error = electron.electron_in_main("await new Promise(() => {})", &[])
+    let error = electron.electron(&["-e", "new Promise(() => {})"])
       .timeout(Duration::from_millis(10)).await.unwrap_err();
     assert!(matches!(error, Error::IpcTimeout { timeout_duration } if timeout_duration == Duration::from_millis(1010)));
     assert!(started.elapsed() >= Duration::from_millis(1010));
@@ -908,7 +924,7 @@ mod tests {
   async fn unlimited_command_still_bounds_writer_order_and_cleans_up_on_write_timeout() {
     let (electron, _peer, _reader) = loopback(READY);
     let _order = electron.writer_order.lock().await;
-    let error = electron.node_in_main("", &[]).await.unwrap_err();
+    let error = electron.node(&["-e", ""]).await.unwrap_err();
     assert!(matches!(error, Error::IpcTimeout { timeout_duration } if timeout_duration <= WAIT));
     assert!(electron.closed.load(Ordering::SeqCst));
     assert!(electron.pending.lock().unwrap().is_empty());
@@ -959,7 +975,7 @@ mod tests {
       cancelled.send(()).unwrap();
       reader
     });
-    let future = electron.electron_in_main("await new Promise(() => {})", &[])
+    let future = electron.electron(&["-e", "new Promise(() => {})"])
       .timeout(Duration::from_secs(1)).max_output_bytes(32).into_future();
     let mut future = Box::pin(future);
     tokio::select! {
@@ -977,9 +993,9 @@ mod tests {
   #[tokio::test]
   async fn shared_main_validates_limits_and_rejects_incomplete_streams() {
     let (electron, peer, reader) = loopback(READY);
-    assert!(electron.node_in_main("", &[]).timeout(Duration::ZERO).await.is_err());
-    assert!(electron.node_in_main("", &[]).max_output_bytes(0).await.is_err());
-    assert!(electron.node_in_main("", &[]).max_output_bytes(256 * 1024 * 1024 + 1).await.is_err());
+    assert!(electron.node(&["-e", ""]).timeout(Duration::ZERO).await.is_err());
+    assert!(electron.node(&["-e", ""]).max_output_bytes(0).await.is_err());
+    assert!(electron.node(&["-e", ""]).max_output_bytes(256 * 1024 * 1024 + 1).await.is_err());
     assert!(electron.command_routes.lock().unwrap().is_empty());
     electron.start_reader(reader).unwrap();
     let peer = std::thread::spawn(move || {
@@ -997,7 +1013,7 @@ mod tests {
       assert_eq!(cancel["params"]["taskId"], request["params"]["taskId"]);
       reader
     });
-    let error = electron.node_in_main("", &[]).on_output(|_| {}).await.unwrap_err();
+    let error = electron.node(&["-e", ""]).on_output(|_| {}).await.unwrap_err();
     assert!(error.to_string().contains("do not match"));
     assert!(electron.command_routes.lock().unwrap().is_empty());
     // Let the Drop guard's best-effort cancellation run on this current runtime.
@@ -1015,7 +1031,7 @@ mod tests {
       reader.read_line(&mut line).unwrap();
       reader.get_ref().shutdown(Shutdown::Both).unwrap();
     });
-    assert!(matches!(electron.node_in_main("", &[]).await, Err(Error::ChannelDisconnected)));
+    assert!(matches!(electron.node(&["-e", ""]).await, Err(Error::ChannelDisconnected)));
     peer.join().unwrap();
     assert!(electron.command_routes.lock().unwrap().is_empty());
     assert!(electron.pending.lock().unwrap().is_empty());

@@ -8,6 +8,7 @@ mod command;
 mod error;
 mod ipc;
 mod metadata;
+pub mod rpc;
 #[cfg(windows)]
 mod pe;
 
@@ -15,6 +16,7 @@ use std::{fs, io, path::{Path, PathBuf}, process::{Command as ProcessCommand, Ou
 use acquisition::DistributionTarget;
 pub use command::{Command, CommandChunk, OutputStream};
 pub use ipc::{Electron, Event, RpcRequest};
+pub use rpc::{app::SetTheme, Theme};
 
 pub use error::{ElectronError, Error};
 
@@ -201,8 +203,38 @@ impl ElectronBuilder {
 /// Accepts an executable, a distribution root, or a resource root containing
 /// `<platform>-<arch>`. Executable headers establish OS/architecture compatibility;
 /// this function never downloads, launches, or repairs files.
-pub fn find_binary(path: impl AsRef<Path>) -> Result<PathBuf, Error> {
-  find_binary_for(path.as_ref(), &DistributionTarget::current()?)
+/// Use [`electron_binary!`] with an optional path to default to the consuming
+/// crate's compile-time `APP_ELECTRON_BINARY` (usually set by its build script).
+pub fn electron_binary(path: impl AsRef<Path>) -> Result<PathBuf, Error> {
+  electron_binary_for(path.as_ref(), &DistributionTarget::current()?)
+}
+
+/// Resolve an optional path, defaulting to the caller's compile-time binary path.
+///
+/// `None::<&Path>` uses `APP_ELECTRON_BINARY` from the consuming crate, not from
+/// this library or the runtime environment. `Some(path)` needs no environment
+/// variable. Both paths use [`electron_binary()`] and its read-only validation.
+///
+/// ```no_run
+/// use std::path::Path;
+/// use electron_rs::electron_binary;
+/// let binary = electron_binary!(None::<&Path>)?;
+/// # Ok::<(), electron_rs::Error>(())
+/// ```
+#[macro_export]
+macro_rules! electron_binary {
+  ($path:expr $(,)?) => {{
+    let path: ::core::option::Option<_> = $path;
+    match path {
+      ::core::option::Option::Some(path) => $crate::electron_binary(path),
+      ::core::option::Option::None => match ::core::option_env!("APP_ELECTRON_BINARY") {
+        ::core::option::Option::Some(path) => $crate::electron_binary(::std::path::Path::new(path)),
+        ::core::option::Option::None => ::core::result::Result::Err($crate::Error::from(
+          "APP_ELECTRON_BINARY was not set at compile time; set it in the consuming build.rs or pass Some(path)",
+        )),
+      },
+    }
+  }};
 }
 
 /// Run an Electron binary in Node mode, without starting the RPC bridge.
@@ -217,7 +249,7 @@ pub fn electron(binary: impl AsRef<Path>, args: &[&str]) -> io::Result<Output> {
   run_command(binary.as_ref(), args, false)
 }
 
-fn find_binary_for(path: &Path, target: &DistributionTarget) -> Result<PathBuf, Error> {
+fn electron_binary_for(path: &Path, target: &DistributionTarget) -> Result<PathBuf, Error> {
   if path.is_file() {
     target.verify_binary(path)?;
     return Ok(path.to_path_buf());
@@ -232,7 +264,7 @@ fn find_binary_for(path: &Path, target: &DistributionTarget) -> Result<PathBuf, 
 }
 
 fn compatible_distribution(path: &Path, version: &str, target: &DistributionTarget) -> Result<PathBuf, Error> {
-  let binary = find_binary_for(path, target)?;
+  let binary = electron_binary_for(path, target)?;
   let root = if target.platform == "darwin" {
     binary.parent().and_then(Path::parent).and_then(Path::parent).and_then(Path::parent)
   } else {
@@ -368,8 +400,8 @@ mod tests {
     for (name, bytes) in ASSETS {
       assert_eq!(fs::read(output.join(name)).unwrap(), *bytes, "staged asset {name}");
     }
-    assert_eq!(find_binary(root.join("runtime")).unwrap(), builder.binary().unwrap());
-    assert!(find_binary(root.join("missing")).is_err());
+    assert_eq!(electron_binary(root.join("runtime")).unwrap(), builder.binary().unwrap());
+    assert!(electron_binary(root.join("missing")).is_err());
     assert!(validate_version("../escape").is_err());
     fs::remove_dir_all(root).unwrap();
   }
@@ -418,6 +450,20 @@ mod tests {
     fs::write(root.join(".electron-rs-version"), "44.0.0").unwrap();
     assert!(compatible_distribution(&root, DEFAULT_VERSION, &target).is_err());
     fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn binary_macro_resolves_explicit_paths_once_and_checks_the_compile_time_default() {
+    let binary = std::env::current_exe().unwrap();
+    let mut evaluated = 0;
+    assert_eq!(electron_binary!({ evaluated += 1; Some(&binary) }).unwrap(), binary);
+    assert_eq!(evaluated, 1);
+    let default = electron_binary!(None::<&Path>);
+    if let Some(path) = option_env!("APP_ELECTRON_BINARY") {
+      assert_eq!(default.map_err(|error| error.to_string()), electron_binary(path).map_err(|error| error.to_string()));
+    } else {
+      assert!(default.unwrap_err().to_string().contains("APP_ELECTRON_BINARY was not set at compile time"));
+    }
   }
 
   #[test]

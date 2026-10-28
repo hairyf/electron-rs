@@ -13,7 +13,6 @@ Build and control an Electron distribution from Rust, without Tauri.
 ```toml
 [dependencies]
 electron-rs = { git = "https://github.com/hairyf/electron-rs.git" }
-serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 
 [build-dependencies]
@@ -40,110 +39,120 @@ fn main() -> Result<(), Error> {
 
 ## Run
 
-Start the prepared runtime from a Tokio runtime. `RpcRequest` types are application-defined:
+Start the prepared runtime from a Tokio runtime. Built-in requests and responses are provided by `electron_rs::rpc::{app, window, webview, protocol}`; `SetTheme` and `Theme` are also re-exported at the crate root. Consumers only implement `RpcRequest` for custom bridge extensions.
 
 ```rust
 use std::{error::Error, path::Path};
-use electron_rs::{find_binary, Electron, RpcRequest};
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct SetTheme { theme: &'static str }
-
-impl RpcRequest for SetTheme {
-    type Response = ();
-    const METHOD: &'static str = "app.theme";
-}
+use electron_rs::{electron_binary, Electron, SetTheme, Theme};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let binary = find_binary(Path::new(env!("APP_ELECTRON_BINARY")))?;
+    let binary = electron_binary!(None::<&Path>)?;
     let electron = Electron::new(binary, 0).await?;
-    electron.call(SetTheme { theme: "system" }).await?;
+    electron.call(SetTheme { theme: Theme::System }).await?;
 
-    let node = electron.node(&["-p", "process.versions.node"])?;
-    assert!(node.status.success());
-    println!("{}", String::from_utf8_lossy(&node.stdout));
+    let output = electron.node(&["-p", "process.versions.node"]).await?;
+    assert!(output.status.success());
+    println!("{}", String::from_utf8_lossy(&output.stdout));
 
     electron.shutdown();
     Ok(())
 }
 ```
 
-`find_binary` accepts an executable, distribution directory, or resource root containing `<platform>-<arch>`. `Electron::new` launches the prepared bridge and requires the crate-owned scripts. `events()` takes the initial blocking receiver once; `on()` and `subscribe()` handle future events.
+`electron_binary!(None::<&Path>)` uses the consuming crate's compile-time `APP_ELECTRON_BINARY`, usually set by its build script. This requires a macro: an ordinary library function cannot read a consumer's compile-time environment. A missing variable returns an error only for `None`; `electron_binary!(Some(path))` works without it. Explicit paths may also use the function `electron_binary(path)`. Both accept an executable, distribution directory, or resource root containing `<platform>-<arch>`, without downloading or modifying files. Runtime environment variables are not consulted.
+
+`Electron::new` launches the prepared bridge and requires the crate-owned scripts. `events()` takes the initial blocking receiver once; `on()` and `subscribe()` handle future events.
 
 ## Execute JavaScript and processes
 
-The connected `electron` client supports four methods:
+The client has two shared-process methods; standalone processes use root-level functions:
 
-| Method | Execution context | Input | Output |
+| API | Execution context | Input | Output |
 | --- | --- | --- | --- |
-| `node_in_main(script, args)` | A short-lived Node Worker in the connected Electron process | Async JavaScript function body | Awaitable `Command` → `std::process::Output` |
-| `electron_in_main(script, args)` | The connected Electron main thread, with access to its app and windows | Async JavaScript function body | Awaitable `Command` → `std::process::Output` |
-| `node(args)` | A new process using the Electron binary in Node mode | CLI arguments | Blocking `io::Result<std::process::Output>` |
-| `electron(args)` | A new process using the Electron binary in normal Electron mode | CLI arguments, such as an app path or `--version` | Blocking `io::Result<std::process::Output>` |
+| `client.node(args)` | A short-lived Node Worker with the connected Electron process PID | CLI arguments | Awaitable `Command` → `std::process::Output` |
+| `client.electron(args)` | The connected Electron main thread, with access to its app and windows | CLI arguments | Awaitable `Command` → `std::process::Output` |
+| `node(binary, args)` | A new process using the Electron binary in Node mode | CLI arguments | Blocking `io::Result<std::process::Output>` |
+| `electron(binary, args)` | A new process using the Electron binary in normal Electron mode | CLI arguments, such as an app path or `--version` | Blocking `io::Result<std::process::Output>` |
 
-### `node_in_main`
+### `node`
 
 Use Node APIs for filesystem work or computation in a Worker. It shares the Electron process PID, but has its own JavaScript context and cannot use Electron's main-thread APIs:
 
 ```rust
 let output = electron
-    .node_in_main("console.log(args[0]);", &["hello"])
+    .node(&["-e", "console.log(process.argv[1]);", "--", "hello"])
     .timeout(std::time::Duration::from_secs(10))
     .await?;
 assert!(output.status.success());
 assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
 ```
 
-### `electron_in_main`
+### `electron`
 
 Use Electron APIs to inspect or control the existing app and its windows:
 
 ```rust
-let output = electron.electron_in_main(
-    r#"
-    const { app, BrowserWindow } = require('electron');
-    await app.whenReady();
-    console.log(app.getName(), BrowserWindow.getAllWindows().length);
+let output = electron.electron(&[
+    "-e", r#"
+    (async () => {
+        const { app, BrowserWindow } = require('electron');
+        await app.whenReady();
+        console.log(app.getName(), BrowserWindow.getAllWindows().length);
+    })()
     "#,
-    &[],
-).await?;
+]).await?;
 assert!(output.status.success());
 println!("{}", String::from_utf8_lossy(&output.stdout));
 ```
 
-Both methods require the `Arc<Electron>` returned by `Electron::new(...).await`. Awaiting the `Command` starts execution on the current Tokio runtime. Bodies receive `args`, `signal`, CommonJS `require`, `process`, and `console`. All four methods return `std::process::Output` on success, with `status` and raw `stdout`/`stderr`; inspect `output.status.success()` or `output.status.code()`. Script return values are ignored, including BigInt and circular objects. Write data to stdout explicitly when needed. Use `.on_output(...)` for ordered byte chunks. Shared commands have no timeout by default; `.timeout(Duration)` adds an optional deadline, and `.max_output_bytes(...)` changes the default 16 MiB output cap. These are trusted Rust-side APIs; main-thread cancellation is cooperative and cannot interrupt synchronous JavaScript.
+Both methods require the `Arc<Electron>` returned by `Electron::new(...).await`. Awaiting the `Command` starts execution on the current Tokio runtime. They accept CLI arguments, not an async function body or a separate script parameter:
 
-### `node`
+- `-e` / `--eval` evaluates JavaScript; `-p` / `--print` prints its result. Use an async IIFE for asynchronous source; top-level `await` / `return` are not supported in CommonJS eval.
+- `-v` / `--version` prints the Node version in Node mode or the Electron version in Electron mode.
+- A CommonJS file or package directory runs its entry module with relative `require`, `__filename` and `__dirname`. Use `--` before a dash-prefixed entry/argument. Eval arguments start at `process.argv[1]`; file arguments start at `process.argv[2]`.
+- ESM entries, REPL/stdin and startup-only V8/Node/Chromium switches are unsupported and return an explicit error. Use standalone functions when a fresh process or full native CLI behavior is required.
+
+The same PID constraint means this is **not a restart or a fully equivalent CLI process**: Electron main-thread globals, module dependencies and app lifecycle remain shared. Normal task-owned asynchronous work is drained before completion; `process.exit` ends the command rather than the host. An eval's returned Promise is awaited, unlike a native CLI's unreferenced pending Promise. No implicit `args` or `signal` variables are injected.
+
+All four APIs return `std::process::Output` with `status` and raw `stdout`/`stderr`; inspect `output.status.success()` or `output.status.code()`. Use `.on_output(...)` for ordered byte chunks. Shared commands have no timeout by default; `.timeout(Duration)` adds an optional deadline, and `.max_output_bytes(...)` changes the default 16 MiB output cap. These are trusted Rust-side APIs, not a security sandbox; main-thread cancellation is cooperative and cannot interrupt synchronous JavaScript.
+
+### Standalone `node(binary, args)`
 
 Run Node CLI arguments with the prepared Electron binary by setting `ELECTRON_RUN_AS_NODE=1` in the child process:
 
 ```rust
-let output = electron.node(&["-p", "process.versions.node"])?;
+use std::path::Path;
+use electron_rs::{electron_binary, node};
+
+let output = node(electron_binary!(None::<&Path>)?, &["-p", "process.versions.node"])?;
 assert!(output.status.success());
 println!("{}", String::from_utf8_lossy(&output.stdout));
 ```
 
-### `electron`
+### Standalone `electron(binary, args)`
 
 Launch a separate Electron process, clearing `ELECTRON_RUN_AS_NODE` in the child environment:
 
 ```rust
-let output = electron.electron(&["--version"])?;
+use std::path::Path;
+use electron_rs::{electron_binary, electron};
+
+let output = electron(electron_binary!(None::<&Path>)?, &["--version"])?;
 assert!(output.status.success());
 println!("{}", String::from_utf8_lossy(&output.stdout));
 ```
 
-These two methods wait for the child to exit and capture its raw `stdout`/`stderr` and `status`. Nonzero exits are `Ok(Output)`; process launch or output collection failures return an I/O error. They do not connect the child to the existing RPC bridge. From async code, use `tokio::task::spawn_blocking` when the process may take time.
+These two functions wait for the child to exit and capture its raw `stdout`/`stderr` and `status`. Nonzero exits are `Ok(Output)`; process launch or output collection failures return an I/O error. They do not connect the child to the existing RPC bridge. From async code, use `tokio::task::spawn_blocking` when the process may take time.
 
-To run a process without starting a connected client, use `electron_rs::node(&binary, args)` / `electron_rs::electron(&binary, args)`, or `ElectronBuilder::node(args)` / `ElectronBuilder::electron(args)` after preparing its distribution.
+These standalone functions need no connected client. `ElectronBuilder::node(args)` / `ElectronBuilder::electron(args)` remain convenience methods for the builder's prepared distribution.
 
 ## API
 
 - `ElectronBuilder`: acquisition, output paths, search paths, resources, and branding metadata.
-- `PreparedDistribution` and `find_binary`: resolve the exact staged paths to bundle or launch.
-- `Electron`: typed `call`, events, subscriptions, shared-main commands, `node`, `electron`, and `shutdown`.
+- `PreparedDistribution` and `electron_binary!` / `electron_binary(path)`: resolve the exact staged paths to bundle or launch.
+- `rpc::{app, window, webview, protocol}`: built-in request and response types; `RpcRequest` remains available for extensions.
+- `Electron`: typed `call`, events, subscriptions, shared-main `node` / `electron` commands, and `shutdown`.
 - `node(binary, args)` / `electron(binary, args)`: standalone process helpers; nonzero exits are `Ok(Output)`.
 - `Metadata`: Windows `.ico`, macOS `.icns`, identifiers, and platform-specific app names.
 

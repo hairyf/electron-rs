@@ -6,14 +6,10 @@ use std::{
   path::Path,
 };
 
-use electron_rs::{arch, platform, ElectronBuilder, DEFAULT_VERSION};
+use electron_rs::{electron_binary, node, DEFAULT_VERSION};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-  let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
-    .join("target/electron")
-    .join(format!("{}-{}", platform(), arch()));
-  let builder = ElectronBuilder::new(DEFAULT_VERSION).output(directory);
-  let output = builder.node(&[
+  let output = node(electron_binary!(None::<&Path>)?, &[
     "-e",
     r#"
     process.stdout.write(JSON.stringify({
@@ -36,4 +32,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   assert_eq!(result["answer"], 42);
   assert_eq!(result["electron"], DEFAULT_VERSION);
   Ok(())
+}
+
+#[test]
+fn default_binary_uses_the_consumers_build_script() {
+  let explicit = electron_binary(Path::new(env!("APP_ELECTRON_BINARY")));
+  let default = electron_binary!(None::<&Path>);
+  assert_eq!(
+    default.map_err(|error| error.to_string()),
+    explicit.map_err(|error| error.to_string()),
+  );
 }

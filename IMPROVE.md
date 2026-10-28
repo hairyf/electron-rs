@@ -23,13 +23,13 @@ let prepared = ElectronBuilder::new(DEFAULT_VERSION)
 ```rust
 use std::path::Path;
 use std::time::Duration;
-use electron_rs::{find_binary, Electron};
+use electron_rs::{electron_binary, Electron};
 use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Path::new("./runtime");
-    let binary = find_binary(runtime)?;
+    let binary = electron_binary(runtime)?;
     
     // 异步启动并建立连接
     let electron = Electron::new(...).await?;
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
 ```rust
-use electron_rs::{ElectronError, find_binary, Electron};
+use electron_rs::{ElectronError, electron_binary, Electron};
 use serde_json::json;
 use std::time::Duration;
 
@@ -93,37 +93,12 @@ async fn handle_electron_call(electron: &Electron) {
 改进后的消费侧代码：通过结构体和 Trait 约束，实现强类型、编译期检查的 RPC 调用。
 
 ```rust
-use electron_rs::{Electron, RpcRequest};
-use serde::{Serialize, Deserialize};
+use electron_rs::{Electron, SetTheme, Theme};
 
-// 1. 定义强类型的请求与响应结构体
-#[derive(Serialize)]
-struct SetThemeRequest {
-    theme: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct SetThemeResponse {
-    success: bool,
-    applied_theme: String,
-}
-
-// 2. 为请求实现 Trait，绑定对应的远程方法名和返回类型
-impl RpcRequest for SetThemeRequest {
-    type Response = SetThemeResponse;
-    const METHOD: &'static str = "app.theme";
-}
-
-// 3. 消费侧调用（完全类型安全，杜绝拼写错误）
+// 内置请求、参数与响应类型由 electron-rs 提供，不需要消费侧重复定义。
+// app.theme 的实际响应为 null，对应 Rust 的 ()。
 async fn update_theme(electron: &Electron) -> Result<(), Box<dyn std::error::Error>> {
-    let req = SetThemeRequest {
-        theme: "system".to_string(),
-    };
-
-    // 编译器会直接推导返回类型为 SetThemeResponse，无需手动解析 JSON
-    let res: SetThemeResponse = electron.call_typed(req).await?;
-    
-    println!("主题设置成功: {}", res.applied_theme);
+    electron.call(SetTheme { theme: Theme::System }).await?;
     Ok(())
 }
 ```
@@ -131,44 +106,15 @@ async fn update_theme(electron: &Electron) -> Result<(), Box<dyn std::error::Err
 5. 使用 rmp-serde (MessagePack) 进行高效二进制 RPC 调用
 
 
+以下仅为传输层改造设想；当前 `Electron::call` 仍使用 JSON，没有引入 MessagePack 依赖。即使更换编码，内置请求也应复用库提供的类型，不应在消费侧重复定义：
+
 ```rust
-use serde::{Serialize, Deserialize};
-use std::time::Duration;
-use electron_rs::Electron;
+use electron_rs::{SetTheme, Theme};
 
-// 1. 定义请求和响应结构体（依然支持标准的 Serde 宏）
-#[derive(Serialize)]
-struct SetThemeParams {
-    theme: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct SetThemeResult {
-    success: bool,
-    applied: String,
-}
-
-async fn update_theme_via_msgpack(electron: &Electron) -> Result<(), Box<dyn std::error::Error>> {
-    let params = SetThemeParams {
-        theme: "system".to_string(),
-    };
-
-    // 2. 核心改动：使用 rmp_serde 将结构体直接序列化为二进制字节流 (Vec<u8>)
-    // 相比 JSON，它没有繁琐的引号和大括号，体积更小、序列化更快
-    let payload = rmp_serde::to_vec(&params)?;
-    
-    println!("MessagePack 序列化后大小: {} bytes", payload.len());
-
-    // 3. 发送二进制 RPC 请求，并获取二进制响应结果
-    let response_bytes = electron
-        .call("app.theme", payload, Duration::from_secs(5))
-        .await?;
-
-    // 4. 使用 rmp_serde 直接从二进制切片反序列化还原响应对象
-    let result: SetThemeResult = rmp_serde::from_slice(&response_bytes)?;
-
-    println!("主题设置成功: {:?}", result);
-    Ok(())
+fn encode_theme_proposal() -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let request = SetTheme { theme: Theme::System };
+    // 命名字段保持与 JavaScript 协议一致；此代码仅演示序列化。
+    rmp_serde::to_vec_named(&request)
 }
 ```
 

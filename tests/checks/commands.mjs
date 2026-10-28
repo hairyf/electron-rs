@@ -3,6 +3,9 @@ import assert from 'node:assert/strict'
 import { createHook } from 'node:async_hooks'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import path from 'node:path'
+import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
 
@@ -49,6 +52,8 @@ function nodeProcess(args, timeoutMs = 5_000) {
   })
 }
 
+const bodyArgs = (script, args = []) => ['-e', `(async function(args) { ${script}\n })(process.argv.slice(1))`, '--', ...args]
+
 async function reference(script, args = []) {
   // A real Node process is the output oracle, never a mock of the executor.
   const result = await nodeProcess(['-e', `
@@ -76,7 +81,7 @@ async function checks() {
   const write = (stream, text) => deadline(new Promise((resolve, reject) => {
     process[stream].write(text + '\n', error => error ? reject(error) : resolve())
   }), `host ${stream} write`)
-  const saved = { exitCode: process.exitCode }
+  const saved = { exitCode: process.exitCode, argv: process.argv, argvValue: [...process.argv] }
   await write('stdout', hostOut[0])
   await write('stderr', hostErr[0])
   const { Executions } = createRequire(import.meta.url)('../../assets/runtime/execution.cjs')
@@ -90,10 +95,10 @@ async function checks() {
   const service = new Executions(transport)
   const chunksFor = taskId => events.filter(entry => entry.event === 'command.output' && entry.params.taskId === taskId)
     .flatMap(entry => entry.params.chunks)
-  const start = (mode, script, overrides = {}) => {
+  const cli = (mode, args, overrides = {}) => {
     const taskId = `command-check-${++nextId}`
     const promise = deadline(Promise.resolve().then(() => service.execute({
-      taskId, mode, script, args: [], maxOutputBytes: 256 * 1024, stream: false, ...overrides,
+      taskId, mode, args, maxOutputBytes: 256 * 1024, stream: false, ...overrides,
     })), taskId).then(result => {
       completed.add(taskId)
       assert.ok(result && typeof result === 'object', `${taskId}: output object`)
@@ -107,6 +112,7 @@ async function checks() {
     promise.catch(() => {})
     return { taskId, promise }
   }
+  const start = (mode, script, { args = [], ...overrides } = {}) => cli(mode, bodyArgs(script, args), overrides)
   const streamed = (taskId, result) => {
     const entries = events.filter(entry => entry.params.taskId === taskId)
     assert.ok(entries.length > 0, `${taskId}: output events`)
@@ -123,7 +129,76 @@ async function checks() {
     }
   }
   try {
-    // Shared async-function bodies exercise actual Node formatting and write overloads.
+    // Public CLI requests are compared directly to Node, with no AsyncFunction-body adapter.
+    const fixture = await mkdtemp(path.join(os.tmpdir(), 'electron-rs-cli-'))
+    try {
+      await mkdir(path.join(fixture, 'package'))
+      await mkdir(path.join(fixture, 'esm'))
+      await writeFile(path.join(fixture, 'package', 'package.json'), JSON.stringify({ type: 'commonjs', main: 'entry.js' }))
+      await writeFile(path.join(fixture, 'package', 'relative.cjs'), `module.exports = { value: 'relative require', argv: () => require('node:process').argv };`)
+      const entry = path.join(fixture, 'package', 'entry.js')
+      const source = `const relative = require('./relative.cjs'); console.log(JSON.stringify({ argv: process.argv, requiredArgv: relative.argv(), filename: __filename, dirname: __dirname, value: relative.value, moduleRequire: module.require('./relative.cjs').value, main: require.main === module }));`
+      await writeFile(entry, source)
+      const cjs = path.join(fixture, 'entry.cjs')
+      await writeFile(cjs, `console.log(JSON.stringify({ argv: process.argv, filename: __filename, dirname: __dirname }));`)
+      await writeFile(path.join(fixture, 'esm', 'package.json'), '{"type":"module"}')
+      await writeFile(path.join(fixture, 'esm', 'entry.js'), 'export default 1')
+      const mjs = path.join(fixture, 'entry.mjs')
+      await writeFile(mjs, 'export default 1')
+      const publicCases = [
+        ['-e', 'console.log(JSON.stringify(process.argv))', 'plain', 'two words'],
+        ['--eval', `console.log(JSON.stringify({ argv: require('node:process').argv, filename: __filename, dirname: __dirname }))`, '--', '--script-flag', '中文'],
+        ['-p', '6 * 7'], ['--print', `({ a: 1, text: 'two' })`],
+        ['-e', `setTimeout(() => console.log('natural timer'), 20)`],
+        ['-e', `(async () => { await new Promise(resolve => setTimeout(resolve, 20)); console.log('IIFE finished') })()`],
+        ['-e', `require('node:fs').readFile(${JSON.stringify(cjs)}, (error, data) => { if (error) throw error; console.log(data.toString().length) })`],
+        ['-v'], ['--version'], [entry, 'script', '--flag'], [cjs, '', 'words'],
+        [path.join(fixture, 'package'), '--arg'], ['--', entry, '--arg'],
+      ]
+      for (const argv of publicCases) {
+        const expected = await nodeProcess(argv)
+        for (const mode of ['node', 'electron']) {
+          // This check host is Node; Electron's version and actual host PID are checked by real_commands.
+          if (mode === 'electron' && (argv[0] === '-v' || argv[0] === '--version')) continue
+          const actual = await cli(mode, argv).promise
+          assert.equal(actual.code, expected.code, `${mode} ${argv[0]}: native CLI exit code`)
+          assert.deepEqual(bytes(actual.stdout, 'stdout'), expected.stdout, `${mode} ${argv[0]}: native CLI stdout`)
+          assert.deepEqual(bytes(actual.stderr, 'stderr'), expected.stderr, `${mode} ${argv[0]}: native CLI stderr`)
+        }
+      }
+      for (const mode of ['node', 'electron']) {
+        for (let invocation = 0; invocation < 2; invocation++) {
+          const actual = await cli(mode, [entry, String(invocation)]).promise
+          assert.equal(JSON.parse(bytes(actual.stdout, 'stdout')).argv[2], String(invocation), `${mode}: repeated file entry executes again`)
+        }
+        for (const argv of [[], ['-'], ['--inspect'], ['--input-type=module', '-e', '1'], ['--unknown'], ['-e'], ['-p'], ['-v', '--inspect'], [mjs], [path.join(fixture, 'esm', 'entry.js')]]) {
+          const actual = await cli(mode, argv).promise
+          assert.notEqual(actual.code, 0, `${mode}: unsupported input fails explicitly`)
+          assert.match(bytes(actual.stderr, 'stderr').toString(), /unsupported|requires|does not accept/i)
+        }
+        for (const source of ['return 1', 'await Promise.resolve(1)']) {
+          const actual = await cli(mode, ['-e', source]).promise
+          assert.equal(actual.code, 1, `${mode}: eval is a script, not an async function body`)
+          assert.match(bytes(actual.stderr, 'stderr').toString(), /SyntaxError/)
+        }
+      }
+      const argvJobs = ['one', 'two', 'three'].map(token => cli('electron', ['-e', `(async () => { const native = require('node:process'); await new Promise(resolve => setTimeout(resolve, 30)); console.log(JSON.stringify([process.argv, native.argv])); })()`, '--', token]))
+      for (const [index, job] of argvJobs.entries()) {
+        const actual = await job.promise
+        assert.deepEqual(JSON.parse(bytes(actual.stdout, 'stdout')), [[process.execPath, ['one', 'two', 'three'][index]], [process.execPath, ['one', 'two', 'three'][index]]], 'overlapping main CLI argv stays task-local')
+      }
+      assert.equal(process.argv, saved.argv, 'main CLI preserves host argv identity')
+      assert.deepEqual(process.argv, saved.argvValue, 'main CLI preserves host argv contents')
+      const requiredProcess = await cli('electron', ['-e', `const native = require('node:process'); native.exitCode = 17; console.log(native.argv[1]);`, '--', 'process facade']).promise
+      assert.equal(requiredProcess.code, 17)
+      assert.equal(bytes(requiredProcess.stdout, 'stdout').toString(), 'process facade\n')
+      assert.equal(process.exitCode, saved.exitCode, 'required process exitCode cannot alter host')
+      const moduleExit = await cli('electron', ['-e', `console.log('required process exit'); require('node:process').exit(9)`]).promise
+      assert.equal(moduleExit.code, 9, 'required process exit is task-scoped')
+      assert.equal(bytes(moduleExit.stdout, 'stdout').toString(), 'required process exit\n')
+    } finally { await rm(fixture, { recursive: true, force: true }) }
+
+    // Legacy body checks keep their semantics through a test-only -e IIFE adapter.
     const cases = [
       ['text', `console.log('hello'); console.error('error text'); return { ok: true };`],
       ['console formatting', `console.log('%s %d %j', 'value', 12, { a: 1 }); console.dir({ list: [1, 'two'], nested: { yes: true } }); console.warn('warn', null, undefined, { value: 3 }); return null;`],
@@ -155,7 +230,7 @@ async function checks() {
         hook.enable()
         try {
           pending = service.execute({
-            taskId, mode, args: [], script: `await new Promise(resolve => setTimeout(resolve, ${shortTimeout * 4})); process.stdout.write('completed without a deadline');`,
+            taskId, mode, args: bodyArgs(`await new Promise(resolve => setTimeout(resolve, ${shortTimeout * 4})); process.stdout.write('completed without a deadline');`),
             ...(timeoutMs === undefined ? {} : { timeoutMs }),
           })
         } finally { hook.disable() }
@@ -306,6 +381,15 @@ async function checks() {
       }
     }
 
+    for (const mode of ['node', 'electron']) {
+      const timerDeadline = await cli(mode, ['-e', `setInterval(() => {}, 20)`], { timeoutMs: 100 }).promise
+      assert.equal(timerDeadline.code, 124, `${mode}: a normal CLI timer remains live until the deadline`)
+      const timerCancel = cli(mode, ['-e', `console.log('timer-ready'); setInterval(() => {}, 20)`], { stream: true })
+      await until(() => chunksFor(timerCancel.taskId).length, `${mode} timer readiness`)
+      service.cancel({ taskId: timerCancel.taskId })
+      assert.equal((await timerCancel.promise).code, 130, `${mode}: cancel ends a live CLI timer`)
+    }
+
     const closing = start('node', `process.stdout.write('close-ready'); setInterval(() => process.stdout.write('tick'), 25);`, { stream: true })
     await until(() => chunksFor(closing.taskId).length > 0, 'close worker readiness')
     await deadline(Promise.resolve(service.close()), 'service.close')
@@ -321,7 +405,7 @@ async function checks() {
     assert.ok(closeHandlers.length > 0, 'service registers transport shutdown cleanup')
     const disconnected = new Executions(transport)
     const pendingId = 'disconnect-check'
-    const pending = deadline(disconnected.execute({ taskId: pendingId, mode: 'node', script: `process.stdout.write('disconnect-ready'); setInterval(() => {}, 25);`, args: [], timeoutMs: null, maxOutputBytes: 1024, stream: true }), 'transport-close Worker')
+    const pending = deadline(disconnected.execute({ taskId: pendingId, mode: 'node', args: bodyArgs(`process.stdout.write('disconnect-ready'); setInterval(() => {}, 25);`), timeoutMs: null, maxOutputBytes: 1024, stream: true }), 'transport-close Worker')
     pending.catch(() => {})
     try {
       await until(() => chunksFor(pendingId).length > 0, 'transport-close worker readiness')
@@ -343,5 +427,5 @@ if (process.argv[2] === '--run') {
   assert.equal(actual.code, 0, `command suite failed:\n${actual.stdout}\n${actual.stderr}`)
   assert.equal(actual.stdout.toString(), [...hostOut, success, ''].join('\n'), 'jobs must not leak output to host; premature host exit must fail')
   assert.equal(actual.stderr.toString(), [...hostErr, ''].join('\n'), 'ordinary host stderr stays outside job capture')
-  console.log(`${success} (Node byte oracle, main/worker identity, async routing, live streaming, cancel/timeout, limits, shutdown)`)
+  console.log(`${success} (direct CLI Node oracle, file/CJS/argv, main/worker identity, async lifecycle/routing, live streaming, cancel/timeout, limits, shutdown)`)
 }
