@@ -455,7 +455,7 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     let node = electron.node(&["-e", "if(process.argv[1]!=='argument with spaces'||process.argv[2]!=='雪 🦀')throw new Error('arguments changed');process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));", "--", "argument with spaces", "雪 🦀"]).unwrap().wait_with_output().await.unwrap();
     assert!(node.status.success(), "{node:?}");
     assert_eq!(node.stdout, oracle.stdout);
-    assert_eq!(node.stderr, oracle.stderr);
+    support::assert_node_stderr(&node.stderr, &oracle.stderr);
     let output = electron.run("process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));return 1n;")
       .timeout(WAIT).max_output_bytes(64).await.unwrap();
     assert!(output.status.success(), "{output:?}");
