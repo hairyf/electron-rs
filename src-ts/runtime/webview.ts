@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
-import type { Cookie, Rectangle, WebContents, WebContentsView } from 'electron'
+import { Menu } from 'electron'
+import type { ContextMenuParams, Cookie, Event, Input, MenuItemConstructorOptions, Rectangle, WebContents, WebContentsView } from 'electron'
 import { cssColor, type Window } from './window'
 
 export interface WebviewPolicy { navigation?: boolean; download?: boolean; permission?: boolean }
@@ -25,10 +26,38 @@ export class Webview extends EventEmitter<WebviewEvents> {
   private closed = false
   private nativePopup = false
   private openingDevtools?: Promise<void>
+  private contextMenu?: Menu
+  private readonly onContextMenu = (_event: Event, params: ContextMenuParams) => {
+    if (this.closed || this.contents.isDestroyed() || this.owner.destroyed) return
+    const flags = params.editFlags
+    const template: MenuItemConstructorOptions[] = []
+    if (params.isEditable) template.push(
+      { role: 'undo', enabled: flags.canUndo }, { role: 'redo', enabled: flags.canRedo }, { type: 'separator' },
+      { role: 'cut', enabled: flags.canCut }, { role: 'copy', enabled: flags.canCopy },
+      { role: 'paste', enabled: flags.canPaste }, { role: 'delete', enabled: flags.canDelete }, { type: 'separator' },
+    )
+    else template.push({ role: 'copy', enabled: flags.canCopy })
+    template.push({ role: 'selectAll', enabled: flags.canSelectAll })
+    if (this.devtoolsAllowed) template.push({ type: 'separator' }, { label: 'Inspect Element', click: () => {
+      if (!this.closed && this.devtoolsAllowed) this.contents.inspectElement(params.x, params.y)
+    } })
+    this.contextMenu?.closePopup()
+    const menu = this.contextMenu = Menu.buildFromTemplate(template)
+    this.contents.focus()
+    menu.popup({ window: this.owner.native, frame: params.frame ?? undefined, sourceType: params.menuSourceType,
+      callback: () => { if (this.contextMenu === menu) this.contextMenu = undefined },
+    })
+  }
+  private readonly onBeforeInput = (event: Event, input: Input) => {
+    if (this.closed || input.type !== 'keyDown' || input.isAutoRepeat || input.key !== 'F12' || !this.devtoolsAllowed) return
+    event.preventDefault()
+    if (this.isDevtoolsOpen()) this.closeDevtools()
+    else void this.openDevtools().catch(error => console.error('open DevTools failed', error))
+  }
   private readonly nativeContents: WebContents
   readonly contentsId: number
   private readonly onResize = () => { if (!this.owner.destroyed) this.resizeWithParent(this.owner.native.getContentBounds()) }
-  constructor(private owner: Window, readonly id: number, readonly view: WebContentsView, private config: WebviewInit) {
+  constructor(private owner: Window, readonly id: number, readonly view: WebContentsView, private config: WebviewInit, private readonly devtoolsEnabled = true) {
     super(); this.nativeContents = view.webContents; this.contentsId = this.nativeContents.id; this.autoResize = Boolean(config.autoResize); this.policy = config.policy; this.bindEvents()
   }
   get window(): Window { return this.owner }
@@ -38,6 +67,8 @@ export class Webview extends EventEmitter<WebviewEvents> {
   get webviewPolicy(): WebviewPolicy | undefined { return this.policy }
   private bindEvents(): void {
     const c = this.contents
+    c.on('context-menu', this.onContextMenu)
+    c.on('before-input-event', this.onBeforeInput)
     c.on('did-navigate', (_e, url) => this.emit('navigationCommitted', url))
     c.on('did-navigate-in-page', (_e, url, isMain) => { if (isMain) this.emit('navigationCommitted', url) })
     c.on('dom-ready', () => { if (this.attached) this.syncOwnerState() })
@@ -85,6 +116,10 @@ export class Webview extends EventEmitter<WebviewEvents> {
   private finishClose(): void {
     if (this.closed) return
     this.closed = true
+    this.contents.removeListener('context-menu', this.onContextMenu)
+    this.contents.removeListener('before-input-event', this.onBeforeInput)
+    this.contextMenu?.closePopup()
+    this.contextMenu = undefined
     this.detach()
     this.main = false
     this.emit('closed')
@@ -125,7 +160,9 @@ export class Webview extends EventEmitter<WebviewEvents> {
   setBackgroundColor(color: string | undefined): void { this.view.setBackgroundColor(color ?? '#00000000') }
   focus(): void { this.owner.focus(); this.contents.focus() }
   print(): Promise<void> { this.contents.print({ silent: false }); return Promise.resolve() }
+  private get devtoolsAllowed(): boolean { return this.devtoolsEnabled && !this.contents.isDestroyed() }
   openDevtools(): Promise<void> {
+    if (!this.devtoolsAllowed) return Promise.reject(new Error('DevTools are disabled for this webview'))
     if (this.openingDevtools) return this.openingDevtools
     const contents = this.contents
     if (contents.devToolsWebContents) return Promise.resolve()

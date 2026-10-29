@@ -65,7 +65,7 @@ export class Factory implements WindowFactory {
             window, options,
             attach: (contents: WebContents) => {
               // Chrome created this guest with the opener; keep that real relationship and session.
-              const page = new Webview(window, webview.webviewId, new WebContentsView({ webContents: contents, webPreferences: options.webPreferences }), { ...webview, autoResize: true })
+              const page = new Webview(window, webview.webviewId, new WebContentsView({ webContents: contents, webPreferences: options.webPreferences }), { ...webview, autoResize: true }, options.webPreferences?.devTools)
               this.deps.webviews.add(page)
               this.wireWebview(page)
               this.deps.policies.attach(page)
@@ -75,7 +75,7 @@ export class Factory implements WindowFactory {
           }
           this.deps.popups.set(request, plan)
         } else {
-          const page = new Webview(window, webview.webviewId, new WebContentsView({ webPreferences: options.webPreferences }), { ...webview, autoResize: true })
+          const page = new Webview(window, webview.webviewId, new WebContentsView({ webPreferences: options.webPreferences }), { ...webview, autoResize: true }, options.webPreferences?.devTools)
           this.deps.webviews.add(page)
           this.wireWebview(page)
           this.deps.policies.attach(page)
@@ -97,8 +97,9 @@ export class Factory implements WindowFactory {
     const init = { ...params, webviewId } as WebviewInit
     const config = { ...window.configuration, ...Object.fromEntries(Object.entries(params).filter(([, value]) => value != null)) } as WindowConfig
     const targetSession = this.sessionFor(init) ?? this.deps.webviews.main(window)?.contents.session ?? session.defaultSession
-    const view = new WebContentsView({ webPreferences: this.webPreferences(init, config, targetSession) })
-    const webview = new Webview(window, webviewId, view, init)
+    const webPreferences = this.webPreferences(init, config, targetSession)
+    const view = new WebContentsView({ webPreferences })
+    const webview = new Webview(window, webviewId, view, init, webPreferences?.devTools)
     this.deps.webviews.add(webview)
     try {
       this.wireWebview(webview)

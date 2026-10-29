@@ -11,6 +11,7 @@ import { createRuntime, runtimeModules } from './runtime-modules.mjs'
 const require = createRequire(import.meta.url)
 let nextId = 0
 let ready
+let contextMenu
 const timers = new Set()
 const tasks = []
 const transport = new EventEmitter()
@@ -78,6 +79,7 @@ class Contents extends EventEmitter {
   loadURL(url) { this.calls.push({ method: 'loadURL', value: url }); this.url = url; return Promise.resolve() }
   getURL() { return this.url ?? '' }
   getLastWebPreferences() { return {} }
+  inspectElement(x, y) { this.inspected = { x, y }; this.openDevTools() }
   executeJavaScript(script) {
     this.script = script
     // Electron waits for did-stop-loading when a webContents has never loaded.
@@ -230,7 +232,10 @@ const appkit = {
 }
 const electron = {
   app: { on() {}, quit() {}, whenReady: () => new Promise((resolve) => { ready = resolve }) },
-  Menu: { setApplicationMenu() {}, buildFromTemplate: (template) => ({ template }) },
+  Menu: { setApplicationMenu() {}, buildFromTemplate: (template) => ({ template,
+    popup(options) { this.options = options; contextMenu = this },
+    closePopup() { this.closed = true },
+  }) },
   nativeTheme, screen,
   session: { defaultSession: { on() {}, setPermissionRequestHandler() {}, webRequest: { onCompleted() {}, onErrorOccurred() {}, onBeforeRequest() {} } } },
   BaseWindow: Window, WebContentsView: View,
@@ -471,6 +476,96 @@ switch (process.argv[2]) {
     result = { evalScripts, cursors, hidden, child, closed,
       remainingDestroyed: remaining.map((view) => view.webContents.isDestroyed()),
       childWebviews: inspect('state.childWebviews.size'), webviews: inspect('state.webviews.size'), policies: inspect('state.handlerPolicy.size') }
+    break
+  }
+  case 'native-interaction': {
+    const main = await createHost(true)
+    await call('webview.create', { windowId: 2, webviewId: 21, url: 'about:blank' })
+    await call('window.create', { windowId: 3, window: { devtools: false },
+      webview: { webviewId: 30, url: 'about:blank', devtools: null } })
+    await call('webview.create', { windowId: 3, webviewId: 31, url: 'about:blank', devtools: null })
+    await call('webview.create', { windowId: 2, webviewId: 22, url: 'about:blank', devtools: false })
+    const key = (contents, overrides = {}) => {
+      let prevented = false
+      contents.emit('before-input-event', { preventDefault() { prevented = true } },
+        { type: 'keyDown', key: 'F12', isAutoRepeat: false, ...overrides })
+      return prevented
+    }
+    const showMenu = (contents, overrides = {}) => {
+      contextMenu = undefined
+      contents.emit('context-menu', {}, { x: 7, y: 9, isEditable: false,
+        editFlags: { canCopy: true, canSelectAll: true }, ...overrides })
+      assert.ok(contextMenu, 'context-menu must open a native menu')
+      return contextMenu
+    }
+    for (const id of [20, 21]) {
+      const contents = runtime.webviews.get(id).contents
+      assert.equal(key(contents, { type: 'keyUp' }), false)
+      assert.equal(key(contents, { key: 'F11' }), false)
+      assert.equal(key(contents, { isAutoRepeat: true }), false)
+      assert.equal(contents.isDevToolsOpened(), false)
+      assert.equal(key(contents), true)
+      assert.equal(contents.isDevToolsOpened(), true, 'F12 opens the focused page DevTools')
+      await settle()
+      assert.equal(key(contents), true)
+      assert.equal(contents.isDevToolsOpened(), false, 'F12 toggles DevTools closed')
+      const menu = showMenu(contents)
+      assert.deepEqual(Array.from(menu.template, item => item.role ?? item.label ?? item.type),
+        ['copy', 'selectAll', 'separator', 'Inspect Element'])
+      assert.equal(menu.options.window, main)
+      menu.template.at(-1).click()
+      assert.deepEqual(contents.inspected, { x: 7, y: 9 })
+      contents.closeDevTools()
+    }
+    const child = runtime.webviews.get(21).contents
+    const editable = showMenu(child, { isEditable: true, editFlags: {
+      canUndo: true, canRedo: false, canCut: true, canCopy: true,
+      canPaste: false, canDelete: true, canSelectAll: true,
+    } })
+    assert.deepEqual(Array.from(editable.template.filter(item => item.role), item => [item.role, item.enabled]),
+      [['undo', true], ['redo', false], ['cut', true], ['copy', true],
+        ['paste', false], ['delete', true], ['selectAll', true]])
+    for (const id of [22, 30, 31]) {
+      const contents = runtime.webviews.get(id).contents
+      assert.equal(runtime.webviews.get(id).view.options.webPreferences.devTools, false)
+      assert.equal(key(contents), false, 'disabled DevTools must leave F12 alone')
+      assert.equal(contents.isDevToolsOpened(), false)
+      const menu = showMenu(contents)
+      assert.deepEqual(Array.from(menu.template, item => item.role), ['copy', 'selectAll'])
+      assert.equal(await errorFrom(() => call('webview.openDevtools', { webviewId: id })), 'DevTools are disabled for this webview')
+    }
+    const previous = runtime.ipc.request
+    runtime.ipc.request = (_event, params) => {
+      call('window.create', { windowId: 4, newWindowRequest: params.request,
+        window: { devtools: false }, webview: { webviewId: 40, url: 'about:blank' } })
+      return { action: 'allow', windowId: 4 }
+    }
+    try {
+      const reply = mainContentsOf(main).openHandler({ url: 'about:blank', features: '', disposition: 'new-window' })
+      assert.equal(reply.action, 'allow')
+      reply.createWindow({ webContents: new Contents() })
+      const guest = runtime.webviews.get(40).contents
+      assert.equal(key(guest), false)
+      assert.equal(showMenu(guest).template.some(item => item.label === 'Inspect Element'), false)
+      guest.close()
+      assert.equal(guest.listenerCount('context-menu'), 0)
+      assert.equal(guest.listenerCount('before-input-event'), 0)
+    } finally { runtime.ipc.request = previous }
+    await call('webview.reparent', { webviewId: 21, windowId: 3 })
+    assert.equal(showMenu(child).options.window, runtime.windows.get(3).native)
+    const closingMenu = contextMenu
+    await call('webview.close', { webviewId: 21 })
+    assert.equal(closingMenu.closed, true, 'close dismisses the native menu')
+    assert.equal(child.listenerCount('context-menu'), 0)
+    assert.equal(child.listenerCount('before-input-event'), 0)
+    assert.doesNotThrow(() => closingMenu.template.at(-1).click())
+    for (const window of runtime.windows.all()) window.destroy()
+    for (const contents of allContents) {
+      assert.equal(contents.listenerCount('context-menu'), 0)
+      assert.equal(contents.listenerCount('before-input-event'), 0)
+    }
+    assert.equal(timers.size, 0)
+    result = { nativeMenus: true, f12: true, disabled: true, popup: true, cleanup: true }
     break
   }
   case 'devtools': {
@@ -727,6 +822,59 @@ switch (process.argv[2]) {
       nativeDpi: { scaleFactor: nativeDpi.scaleFactor, constraints: nativeDpi.contentConstraints },
       nativeCleared: (await call('window.geometry', { windowId: 40 })).contentConstraints,
       legacyCleared: constraintsOf(host) }
+    break
+  }
+  case 'minimized-constraints': {
+    for (const [index, frame] of [{ width: 0, height: 0 }, { width: 16, height: 38 }].entries()) {
+      const windowId = 41 + index
+      await call('window.create', { windowId,
+        window: { width: 1200, height: 800, minWidth: 860, minHeight: 620,
+          maxWidth: 1600, maxHeight: 1200, decorations: index === 1 } })
+      const host = inspect(`state.windows.get(${windowId})`)
+      host.frame = frame
+      host.emit('resize')
+      const normal = host.getBounds(), content = host.getContentBounds()
+      const limits = constraintsOf(host)
+      const getBounds = host.getBounds.bind(host)
+      let minimized = false
+      host.isMinimized = () => minimized
+      host.getBounds = () => minimized ? { ...normal } : getBounds()
+      host.minimize = () => {
+        minimized = true
+        host.content.width = host.content.height = 0
+        host.emit('minimize')
+        host.emit('resize')
+        host.emit('move')
+      }
+      host.restore = () => {
+        minimized = false
+        host.content = { ...content,
+          width: Math.max(content.width, host.minimum[0] - frame.width),
+          height: Math.max(content.height, host.minimum[1] - frame.height) }
+        host.emit('restore')
+      }
+      for (let cycle = 0; cycle < 3; cycle++) {
+        await call('window.minimize', { windowId })
+        screen.emit('display-metrics-changed')
+        assert.deepEqual(constraintsOf(host), limits, 'minimized client bounds must not become frame dimensions')
+        minimized = false
+        host.emit('resize')
+        assert.deepEqual(constraintsOf(host), limits, 'zero client bounds during restore must not change constraints')
+        minimized = true
+        await call('window.unminimize', { windowId })
+        await call('window.show', { windowId })
+        assert.deepEqual(host.getBounds(), normal, 'taskbar minimize and restore must keep the original window size')
+      }
+      await call('window.minimize', { windowId })
+      host.scale = 1
+      await call('window.maxSize', { windowId, width: 3200, height: 2400, physical: true })
+      assert.deepEqual(host.getContentSize(), [0, 0], 'constraint changes must not resize a minimized native window')
+      await call('window.unminimize', { windowId })
+      assert.deepEqual(host.maximum, [3200 + frame.width, 2400 + frame.height], 'restore must apply deferred display constraints')
+      host.destroy()
+      assert.equal(host.listenerCount('restore'), 0, 'destroy must remove the constraint restore listener')
+    }
+    result = { restoredSize: true, stableConstraints: true, deferredConstraints: true }
     break
   }
   case 'cursors': {
@@ -1199,6 +1347,7 @@ switch (process.argv[2]) {
   }
   case 'restore': {
     const main = await createHost(true)
+    const initialRestoreListeners = main.listenerCount('restore')
     context.process.platform = 'darwin'
     let finishRestore
     main.isMinimized = () => true
@@ -1215,7 +1364,7 @@ switch (process.argv[2]) {
     await call('window.hide', { windowId: 2 })
     const hidden = (await call('window.geometry', { windowId: 2 })).visible
     await call('window.show', { windowId: 2 })
-    result = { beforeEvent, restored, restoreListeners: main.listenerCount('restore'),
+    result = { beforeEvent, restored, restoreListeners: main.listenerCount('restore') - initialRestoreListeners,
       hidden, shown: (await call('window.geometry', { windowId: 2 })).visible, timers: timers.size }
     break
   }

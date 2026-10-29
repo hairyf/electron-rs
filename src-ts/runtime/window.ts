@@ -87,6 +87,7 @@ export class Window extends EventEmitter<WindowEvents> {
     this.native.on('move', this.onMetricsChanged)
     this.native.on('maximize', this.onMetricsChanged)
     this.native.on('unmaximize', this.onMetricsChanged)
+    this.native.on('restore', this.onMetricsChanged)
     this.native.on('enter-full-screen', this.onMetricsChanged)
     this.native.on('leave-full-screen', this.onMetricsChanged)
     this.native.on('leave-full-screen', () => this.restoreFullscreen())
@@ -126,7 +127,7 @@ export class Window extends EventEmitter<WindowEvents> {
     this.unsubscribeTheme?.(); this.unsubscribeTheme = undefined
     this.env.screen.removeListener('display-metrics-changed', this.onMetricsChanged)
     const emitter = this.native as unknown as NodeJS.EventEmitter
-    for (const event of ['resize', 'move', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen'])
+    for (const event of ['resize', 'move', 'maximize', 'unmaximize', 'restore', 'enter-full-screen', 'leave-full-screen'])
       emitter.removeListener(event, this.onMetricsChanged)
   }
 
@@ -188,11 +189,14 @@ export class Window extends EventEmitter<WindowEvents> {
     this.constraints = { ...this.constraints, ...changes }
     this.appliedConstraints = undefined
     this.applyConstraints()
-    const { width, height } = this.native.getContentBounds(); this.setSize({ width, height })
+    if (!this.native.isMinimized()) {
+      const { width, height } = this.native.getContentBounds(); this.setSize({ width, height })
+    }
   }
   applyConstraints(): void {
-    if (this.destroyed) return
+    if (this.destroyed || this.native.isMinimized()) return
     const c = this.contentConstraints, bounds = this.native.getBounds(), content = this.native.getContentBounds()
+    if (content.width <= 0 || content.height <= 0) return
     const frameWidth = Math.max(0, bounds.width - content.width), frameHeight = Math.max(0, bounds.height - content.height)
     const outer = (value: number | undefined, frame: number) => value && value > 0 ? value + frame : 0
     const min = [outer(c.minWidth, frameWidth), outer(c.minHeight, frameHeight)] as const
