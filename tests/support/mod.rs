@@ -25,8 +25,20 @@ pub fn assert_node_stderr(stderr: &[u8], expected: &[u8]) {
   assert!(prefix.is_empty(), "unexpected Node stderr prefix: {prefix:?}");
 }
 
+#[cfg(test)]
+mod tests {
+  use super::assert_node_stderr;
+
+  #[test]
+  fn node_stderr_keeps_requested_bytes_and_rejects_unknown_prefixes() {
+    assert_node_stderr(b"expected", b"expected");
+    assert!(std::panic::catch_unwind(|| assert_node_stderr(b"unexpected expected", b"expected")).is_err());
+  }
+}
+
 // Node executes the production JavaScript; Rust owns the assertions. These
 // fixtures never launch Electron or children, and each has a parent deadline.
+#[allow(dead_code)]
 pub fn node(script: impl AsRef<Path>, args: &[&str]) -> String {
   let script = script.as_ref();
   let mut child = Command::new("node")
