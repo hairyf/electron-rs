@@ -6,6 +6,25 @@ use std::{
   time::{Duration, Instant},
 };
 
+pub fn assert_node_stderr(stderr: &[u8], expected: &[u8]) {
+  let prefix = stderr
+    .strip_suffix(expected)
+    .expect("Node stderr preserves requested bytes");
+  #[cfg(windows)]
+  if !prefix.is_empty() {
+    let diagnostic = std::str::from_utf8(prefix).expect("Electron diagnostic is UTF-8");
+    let lines: Vec<_> = diagnostic.lines().collect();
+    assert!(!lines.is_empty());
+    for line in lines {
+      assert!(line.starts_with('['));
+      assert!(line.contains(r"ERROR:third_party\crashpad\crashpad\util\win\registration_protocol_win.cc:108] CreateFile:"));
+      assert!(line.ends_with("(0x2)"));
+    }
+  }
+  #[cfg(not(windows))]
+  assert!(prefix.is_empty(), "unexpected Node stderr prefix: {prefix:?}");
+}
+
 // Node executes the production JavaScript; Rust owns the assertions. These
 // fixtures never launch Electron or children, and each has a parent deadline.
 pub fn node(script: impl AsRef<Path>, args: &[&str]) -> String {

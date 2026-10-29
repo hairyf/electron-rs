@@ -20,6 +20,8 @@ use std::{
   time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod support;
+
 use electron_rs::{
   arch, electron_binary, platform, Electron, ElectronBuilder, Error, Metadata, RpcRequest,
   DEFAULT_VERSION,
@@ -352,7 +354,7 @@ fn prepare_bridge() {
     .expect("collect nonzero Node output").wait_with_output().await.unwrap() });
   assert_eq!(failed.status.code(), Some(23));
   assert!(failed.stdout.is_empty());
-  assert_eq!(failed.stderr, b"bridge-node-error");
+  support::assert_node_stderr(&failed.stderr, b"bridge-node-error");
   let silent = block_on(async { builder
     .node(&["-e", "process.exit(17)"])
     .expect("collect silent Node failure").wait_with_output().await.unwrap() });
@@ -664,7 +666,7 @@ fn real_bridge() {
     .expect("collect connected Node failure output").wait_with_output().await.unwrap() });
   assert_eq!(failed.status.code(), Some(23));
   assert!(failed.stdout.is_empty());
-  assert_eq!(failed.stderr, b"connected-node-error");
+  support::assert_node_stderr(&failed.stderr, b"connected-node-error");
   let error = rpc(electron, "bridge.unknown", Value::Null).unwrap_err();
   assert!(
     matches!(&error, Error::Rpc { method, message }
