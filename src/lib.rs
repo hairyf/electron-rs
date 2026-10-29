@@ -171,7 +171,12 @@ impl ElectronBuilder {
         .map_err(|error| Error::with_source("prepared binary is outside staging", error))?;
       let binary = output.join(relative);
       // No fallible preparation remains after the directory rename commits.
-      let cleanup_warning = acquisition::replace_directory(&stage, &output)?;
+      let cleanup_warning = match acquisition::replace_directory(&stage, &output) {
+        Ok(warning) => warning,
+        // ponytail: one output, several builds; a complete one published by another build is reusable.
+        Err(error) if metadata::matches(&output, metadata, &target, &self.version, pe).unwrap_or(false) && assets_match(&output, &target) => Some(error),
+        Err(error) => return Err(error),
+      };
       Ok(PreparedDistribution { directory: output, binary, cleanup_warning })
     })();
     if result.is_err() {

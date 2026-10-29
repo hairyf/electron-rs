@@ -481,7 +481,14 @@ pub(crate) fn download(version: &str, target: &DistributionTarget) -> Result<Pat
     if !version_matches(&stage, version) {
       return Err(format!("{name} has no matching Electron {version} version evidence").into());
     }
-    if let Some(warning) = replace_directory(&stage, &dist)? { eprintln!("[electron] {warning}"); }
+    match replace_directory(&stage, &dist) {
+      Ok(Some(warning)) => eprintln!("[electron] {warning}"),
+      Ok(None) => (),
+      Err(error) => {
+        if verified_dist(&dist, version, target).is_none() { return Err(error); }
+        eprintln!("[electron] reuse {} published by another build", dist.display());
+      }
+    }
     Ok(dist)
   })();
   if result.is_err() { let _ = fs::remove_dir_all(&stage); }
@@ -535,13 +542,28 @@ fn digest(path: &Path) -> Result<String, Error> {
   Err(failure.unwrap_or_else(|| "no SHA-256 tool available".into()).context("cannot verify Electron archive"))
 }
 
+fn is_zip(archive: &Path) -> Result<bool, Error> {
+  let mut magic = [0; 4];
+  let mut file = File::open(archive)
+    .map_err(|error| Error::with_source(format!("open {}", archive.display()), error))?;
+  file.read_exact(&mut magic)
+    .map_err(|error| Error::with_source(format!("read {}", archive.display()), error))?;
+  Ok(magic == *b"PK\x03\x04")
+}
+
+/// Archives are ZIPs; an extractor that silently skips entries is worse than none.
 fn unpack(archive: &Path, into: &Path) -> Result<(), Error> {
-  let mut tar = Command::new("tar");
-  tar.arg("-xf").arg(archive).arg("-C").arg(into);
-  if run(&mut tar).is_ok() { return Ok(()); }
   let mut unzip = Command::new("unzip");
   unzip.args(["-q", "-o"]).arg(archive).arg("-d").arg(into);
-  run(&mut unzip).map_err(|error| error.context("no usable extractor (tar or unzip)"))
+  let mut tar = Command::new("tar");
+  tar.arg("-xf").arg(archive).arg("-C").arg(into);
+  let (first, second, fallback) = if is_zip(archive)? {
+    (&mut unzip as &mut Command, &mut tar as &mut Command, "unzip or tar")
+  } else {
+    (&mut tar as &mut Command, &mut unzip as &mut Command, "tar or unzip")
+  };
+  if run(first).is_ok() { return Ok(()); }
+  run(second).map_err(|error| error.context(format!("no usable extractor ({fallback})")))
 }
 
 fn run(command: &mut Command) -> Result<(), Error> {
@@ -631,6 +653,18 @@ mod tests {
   }
 
   fn target(triple: &str) -> DistributionTarget { DistributionTarget::from_triple(triple).unwrap() }
+
+  #[test]
+  fn zip_archives_are_detected_before_choosing_an_extractor() {
+    let root = temporary("zip-magic");
+    let archive = root.join("electron.zip");
+    fs::write(&archive, b"PK\x03\x04rest").unwrap();
+    assert!(is_zip(&archive).unwrap());
+    fs::write(&archive, vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0]).unwrap();
+    assert!(!is_zip(&archive).unwrap());
+    assert!(is_zip(&root.join("missing.zip")).is_err());
+    fs::remove_dir_all(root).unwrap();
+  }
 
   #[test]
   fn checksum_requires_a_full_hex_digest_for_the_exact_artifact() {
