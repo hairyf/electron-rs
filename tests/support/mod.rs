@@ -6,6 +6,7 @@ use std::{
   time::{Duration, Instant},
 };
 
+#[allow(dead_code)]
 pub fn assert_node_stderr(stderr: &[u8], expected: &[u8]) {
   let prefix = stderr
     .strip_suffix(expected)
