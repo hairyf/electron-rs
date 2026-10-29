@@ -326,3 +326,32 @@ fn sessions_isolate_profiles_and_install_policies_and_protocols_once() {
     json!({ "pending": 0, "timers": 0, "destroyedListeners": [0, 0] })
   );
 }
+
+
+#[test]
+fn webview_tag_guests_reach_policy_ipc_and_cleanup() {
+    let observed = observations("guest");
+
+    assert_eq!(observed["guestRange"], true);
+    assert_eq!(observed["sameAsAttached"], true, "forContents must find the guest");
+    assert_eq!(
+        observed["preferences"],
+        json!({
+            "preload": "preload.cjs", "contextIsolation": true, "sandbox": true,
+            "nodeIntegration": false, "webviewTag": true,
+        })
+    );
+    assert_eq!(
+        observed["ipcMessages"],
+        json!([{ "event": "ipc.message", "params": {
+            "webviewId": 1_048_576, "url": "https://page.invalid/", "body": "guest message",
+        } }])
+    );
+    assert_eq!(observed["navigation"]["request"]["webviewId"], 1_048_576);
+    assert_eq!(observed["navigation"]["request"]["url"], "https://submit.invalid/form");
+    assert_eq!(observed["navigation"]["replies"], json!([{ "cancel": false }]));
+    assert_eq!(observed["fetched"]["status"], 200);
+    assert_eq!(observed["closed"]["event"], "webview.closed");
+    assert_eq!(observed["closed"]["params"]["webviewId"], 1_048_576);
+    assert_eq!(observed["remaining"], false);
+}

@@ -56,9 +56,17 @@ export class Webview extends EventEmitter<WebviewEvents> {
   }
   private readonly nativeContents: WebContents
   readonly contentsId: number
+  /** Chromium owns the guest's view and layout; only events and policy are ours. */
+  readonly adopted: boolean
   private readonly onResize = () => { if (!this.owner.destroyed) this.resizeWithParent(this.owner.native.getContentBounds()) }
-  constructor(private owner: Window, readonly id: number, readonly view: WebContentsView, private config: WebviewInit, private readonly devtoolsEnabled = true) {
-    super(); this.nativeContents = view.webContents; this.contentsId = this.nativeContents.id; this.autoResize = Boolean(config.autoResize); this.policy = config.policy; this.bindEvents()
+  constructor(private owner: Window, readonly id: number, readonly view: WebContentsView | undefined, private config: WebviewInit, private readonly devtoolsEnabled = true, guest?: WebContents) {
+    super()
+    if (!view && !guest) throw new Error('webview requires a view or an adopted guest')
+    this.adopted = guest !== undefined
+    this.nativeContents = guest ?? view!.webContents
+    this.contentsId = this.nativeContents.id; this.autoResize = Boolean(config.autoResize); this.policy = config.policy
+    this.attached = this.adopted
+    this.bindEvents()
   }
   get window(): Window { return this.owner }
   get contents(): WebContents { return this.nativeContents }
@@ -83,13 +91,15 @@ export class Webview extends EventEmitter<WebviewEvents> {
     })
   }
   attach(options: { main?: boolean; navigate?: boolean }): Promise<void> {
+    if (this.adopted) throw new Error('an adopted webview is laid out by Chromium')
     if (this.attached) this.detach()
     this.main = Boolean(options.main)
     this.nativePopup = this.main && options.navigate === false
     const config = { ...this.owner.configuration, ...Object.fromEntries(Object.entries(this.config).filter(([, value]) => value != null)) }
-    this.view.setBackgroundColor(cssColor(config.backgroundColor) ?? (config.transparent ? '#00000000' : '#ffffff'))
+    const view = this.view!
+    view.setBackgroundColor(cssColor(config.backgroundColor) ?? (config.transparent ? '#00000000' : '#ffffff'))
     if (config.userAgent != null) this.contents.setUserAgent(String(config.userAgent))
-    this.owner.native.contentView.addChildView(this.view)
+    this.owner.native.contentView.addChildView(view)
     this.attached = true
     this.owner.native.on('resize', this.onResize)
     const parent = this.owner.native.getContentBounds()
@@ -108,9 +118,9 @@ export class Webview extends EventEmitter<WebviewEvents> {
   }
   private syncOwnerState(): void { this.owner.syncContents(this.contents) }
   detach(): void {
-    if (!this.attached) return
+    if (!this.attached || this.adopted) return
     this.owner.native.removeListener('resize', this.onResize)
-    if (!this.owner.destroyed) this.owner.native.contentView.removeChildView(this.view)
+    if (!this.owner.destroyed) this.owner.native.contentView.removeChildView(this.view!)
     this.attached = false
   }
   private finishClose(): void {
@@ -132,12 +142,16 @@ export class Webview extends EventEmitter<WebviewEvents> {
   goForward(): void { const h = (this.contents as NativeContents).navigationHistory; if (h?.canGoForward()) h.goForward() }
   canGoForward(): boolean { return Boolean((this.contents as NativeContents).navigationHistory?.canGoForward()) }
   evaluate(script: string): Promise<unknown> { return this.contents.executeJavaScript(script, true) }
-  snapshot(): WebviewSnapshot { const scaleFactor = this.owner.scale; const contentBounds = this.owner.native.getContentBounds(); const c = this.view as NativeView; return { scaleFactor, bounds: this.physical(this.view.getBounds(), scaleFactor), contentBounds: this.physical(contentBounds, scaleFactor), visible: !this.owner.destroyed && this.owner.native.isVisible() && (c.getVisible?.() ?? true) } }
+  snapshot(): WebviewSnapshot {
+    const scaleFactor = this.owner.scale, contentBounds = this.owner.native.getContentBounds()
+    if (this.adopted) return { scaleFactor, bounds: this.physical(contentBounds, scaleFactor), contentBounds: this.physical(contentBounds, scaleFactor), visible: !this.owner.destroyed && !this.contents.isDestroyed() }
+    const c = this.view as NativeView; return { scaleFactor, bounds: this.physical(this.view!.getBounds(), scaleFactor), contentBounds: this.physical(contentBounds, scaleFactor), visible: !this.owner.destroyed && this.owner.native.isVisible() && (c.getVisible?.() ?? true) } }
   private physical(rect: Rectangle, scale: number): Rectangle { return { x: Math.round(rect.x * scale), y: Math.round(rect.y * scale), width: Math.round(rect.width * scale), height: Math.round(rect.height * scale) } }
-  private setNativeBounds(bounds: Rectangle): void { if (!Object.values(bounds).every(Number.isFinite) || bounds.width < 0 || bounds.height < 0) throw new Error('invalid child webview bounds'); this.view.setBounds(bounds); this.reference = { bounds: { ...bounds }, parent: this.owner.native.getContentBounds() } }
+  private setNativeBounds(bounds: Rectangle): void { if (!Object.values(bounds).every(Number.isFinite) || bounds.width < 0 || bounds.height < 0) throw new Error('invalid child webview bounds'); this.view!.setBounds(bounds); this.reference = { bounds: { ...bounds }, parent: this.owner.native.getContentBounds() } }
   private toDip(value: number, physical?: boolean): number { return Math.round(value / (physical ? this.owner.scale : 1)) }
   setBounds(input: WebviewBoundsInput): void {
-    const bounds = { ...this.view.getBounds() }
+    if (this.adopted) return
+    const bounds = { ...this.view!.getBounds() }
     if (input.position) {
       bounds.x = this.toDip(input.position.x, input.position.physical ?? input.physical)
       bounds.y = this.toDip(input.position.y, input.position.physical ?? input.physical)
@@ -148,16 +162,16 @@ export class Webview extends EventEmitter<WebviewEvents> {
     }
     this.setNativeBounds(bounds)
   }
-  setAutoResize(autoResize: boolean): void { this.autoResize = autoResize; this.reference = { bounds: this.view.getBounds(), parent: this.owner.native.getContentBounds() } }
+  setAutoResize(autoResize: boolean): void { if (this.adopted) return; this.autoResize = autoResize; this.reference = { bounds: this.view!.getBounds(), parent: this.owner.native.getContentBounds() } }
   resizeWithParent(parent: Rectangle): void {
-    if (!this.attached || !this.autoResize || !this.reference || parent.width <= 0 || parent.height <= 0) return
+    if (!this.attached || this.adopted || !this.autoResize || !this.reference || parent.width <= 0 || parent.height <= 0) return
     const r = this.reference
-    if (r.parent.width <= 0 || r.parent.height <= 0) { this.reference = { bounds: this.view.getBounds(), parent }; return }
+    if (r.parent.width <= 0 || r.parent.height <= 0) { this.reference = { bounds: this.view!.getBounds(), parent }; return }
     const x = Math.round(r.bounds.x * parent.width / r.parent.width), y = Math.round(r.bounds.y * parent.height / r.parent.height)
-    this.view.setBounds({ x, y, width: Math.round((r.bounds.x + r.bounds.width) * parent.width / r.parent.width) - x, height: Math.round((r.bounds.y + r.bounds.height) * parent.height / r.parent.height) - y })
+    this.view!.setBounds({ x, y, width: Math.round((r.bounds.x + r.bounds.width) * parent.width / r.parent.width) - x, height: Math.round((r.bounds.y + r.bounds.height) * parent.height / r.parent.height) - y })
   }
-  setVisible(visible: boolean): void { (this.view as NativeView).setVisible?.(visible) }
-  setBackgroundColor(color: string | undefined): void { this.view.setBackgroundColor(color ?? '#00000000') }
+  setVisible(visible: boolean): void { if (this.adopted) return; (this.view as NativeView).setVisible?.(visible) }
+  setBackgroundColor(color: string | undefined): void { if (this.adopted) return; this.view!.setBackgroundColor(color ?? '#00000000') }
   focus(): void { this.owner.focus(); this.contents.focus() }
   print(): Promise<void> { this.contents.print({ silent: false }); return Promise.resolve() }
   private get devtoolsAllowed(): boolean { return this.devtoolsEnabled && !this.contents.isDestroyed() }
@@ -201,19 +215,20 @@ export class Webview extends EventEmitter<WebviewEvents> {
   clearBrowsingData(): Promise<null> { return this.contents.session.clearStorageData().then(() => null) }
   reparent(destination: Window): void {
     if (destination === this.owner) return
-    const previousOwner = this.owner, previous = this.view.getBounds(), reference = this.reference
+    if (this.adopted) throw new Error('a <webview> guest follows its parent document')
+    const previousOwner = this.owner, previous = this.view!.getBounds(), reference = this.reference
     const ratio = previousOwner.scale / destination.scale
     const bounds = Object.fromEntries(Object.entries(previous).map(([key, value]) => [key, Math.round(value * ratio)])) as unknown as Rectangle
-    previousOwner.native.contentView.removeChildView(this.view)
+    previousOwner.native.contentView.removeChildView(this.view!)
     try {
-      destination.native.contentView.addChildView(this.view)
+      destination.native.contentView.addChildView(this.view!)
       this.owner = destination
       this.setNativeBounds(bounds)
     } catch (error) {
       this.owner = previousOwner
-      destination.native.contentView.removeChildView(this.view)
-      previousOwner.native.contentView.addChildView(this.view)
-      this.view.setBounds(previous)
+      destination.native.contentView.removeChildView(this.view!)
+      previousOwner.native.contentView.addChildView(this.view!)
+      this.view!.setBounds(previous)
       this.reference = reference
       throw error
     }

@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { app, BaseWindow, nativeImage, session, WebContentsView } from 'electron'
-import type { BrowserWindowConstructorOptions, Session, WebContents } from 'electron'
+import type { BrowserWindowConstructorOptions, Session, WebContents, WebPreferences } from 'electron'
 import type { Policies, PopupPlan } from './policy'
 import type { Protocols } from './protocol'
 import type { Transport } from '../socket/transport'
@@ -168,7 +168,7 @@ export class Factory implements WindowFactory {
 
   private webPreferences(webview: Params, config: WindowConfig, target = this.sessionFor(webview)): BrowserWindowConstructorOptions['webPreferences'] {
     return {
-      contextIsolation: true, sandbox: true, nodeIntegration: false, webviewTag: false,
+      contextIsolation: true, sandbox: true, nodeIntegration: false, webviewTag: config.webviewTag ?? true,
       nodeIntegrationInSubFrames: true, session: target,
       preload: this.writeInitPreload(webview.webviewId, webview.initScripts),
       javascript: config.javascriptDisabled !== true, devTools: config.devtools !== false,
@@ -213,5 +213,32 @@ export class Factory implements WindowFactory {
       this.deps.webviews.delete(id)
       this.deps.transport.send('webview.closed', { webviewId: id })
     })
+    if (webview.adopted) return
+    const contents = webview.contents
+    contents.on('will-attach-webview', (_event, preferences) => this.guestPreferences(webview, preferences))
+    contents.on('did-attach-webview', (_event, guest) => this.adoptGuest(webview, guest))
   }
+
+  private guestPreferences(host: Webview, preferences: WebPreferences): void {
+    preferences.preload = path.join(__dirname, '..', 'preload.cjs')
+    preferences.contextIsolation = true
+    preferences.sandbox = true
+    preferences.nodeIntegration = false
+    preferences.webviewTag = host.window.configuration.webviewTag ?? true
+  }
+
+  private adoptGuest(host: Webview, contents: WebContents): void {
+    if (this.deps.webviews.forContents(contents.id)) return
+    const window = host.window
+    const webviewId = Factory.nextGuestWebviewId++
+    const page = new Webview(window, webviewId, undefined,
+      { webviewId, url: contents.getURL(), autoResize: true, policy: host.webviewPolicy },
+      window.configuration.devtools !== false, contents)
+    this.deps.webviews.add(page)
+    this.wireWebview(page)
+    this.deps.policies.attach(page)
+    this.deps.transport.send('webview.attached', { webviewId, windowId: window.id, contentsId: contents.id, url: contents.getURL() })
+  }
+
+  private static nextGuestWebviewId = 1 << 20
 }

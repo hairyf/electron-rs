@@ -1116,8 +1116,8 @@ switch (process.argv[2]) {
       get: () => guest.isDestroyed() ? undefined : guest,
     })
     assert.deepEqual(roots, {
-      mainOptions: false, mainView: false, child: false,
-      popupOptions: false, popupView: false,
+      mainOptions: true, mainView: true, child: true,
+      popupOptions: true, popupView: true,
     })
     events.length = 0
     assert.doesNotThrow(() => guest.close())
@@ -1183,6 +1183,51 @@ switch (process.argv[2]) {
     assert.deepEqual(noSocketClose, { prevented: false, destroyed: true, events: [] })
     assert.deepEqual(closedSocketClose, { prevented: false, destroyed: true, events: [] })
     result = { roots, nativeDestroy, explicitClose, noSocketClose, closedSocketClose }
+    break
+  }
+  case 'guest-webview': {
+    inspect('state.socket = {closed:false}')
+    const events = []
+    context.send = (message) => events.push(JSON.parse(JSON.stringify(message)))
+    await call('window.create', { windowId: 1, window: { webviewTag: false },
+      webview: { webviewId: 10, url: 'tauri://localhost/' } })
+    const disabled = inspect('state.mainViews').get(inspect('state.windows.get(1)')).view.options.webPreferences.webviewTag
+    await call('window.create', { windowId: 2, webview: { webviewId: 11, url: 'tauri://localhost/' } })
+    const host = inspect('state.windows.get(2)')
+    const contents = mainContentsOf(host)
+    const defaults = inspect('state.mainViews').get(host).view.options.webPreferences.webviewTag
+
+    const preferences = {}
+    contents.emit('will-attach-webview', {}, preferences)
+    const guest = new Contents()
+    events.length = 0
+    contents.emit('did-attach-webview', {}, guest)
+    const adopted = inspect(`state.webviewByContents.get(${guest.id})`)
+    const page = runtime.webviews.peek(adopted)
+    const attached = {
+      preferences: {
+        preload: path.basename(preferences.preload ?? ''),
+        contextIsolation: preferences.contextIsolation, sandbox: preferences.sandbox,
+        nodeIntegration: preferences.nodeIntegration, webviewTag: preferences.webviewTag,
+      },
+      adopted, adoptedByContents: inspect(`state.webviewByContents.has(${guest.id})`),
+      windowMapped: runtime.webviews.of(runtime.windows.get(2)).length,
+      main: page?.isMain, contents: page?.contents === guest, hasView: page?.view !== undefined,
+      childViews: host.children.length,
+      policyAttached: Boolean(guest.openHandler), events: events.splice(0),
+      idIsGuestRange: adopted >= 1 << 20,
+    }
+    contents.emit('did-attach-webview', {}, guest)
+    attached.duplicateIgnored = runtime.webviews.of(runtime.windows.get(2)).length
+    guest.close()
+    const cleaned = {
+      mapped: inspect(`state.webviewByContents.has(${guest.id})`),
+      webviews: runtime.webviews.of(runtime.windows.get(2)).length,
+      events: events.splice(0),
+    }
+    events.length = 0
+    await call('window.destroy', { windowId: 2 })
+    result = { disabled, defaults, attached, cleaned, destroyed: { events: events.splice(0) } }
     break
   }
   case 'linux-state': {
@@ -1371,6 +1416,6 @@ switch (process.argv[2]) {
   default: throw new Error(`unknown scenario ${process.argv[2]}`)
 }
 for (const view of inspect('state.childWebviews').values()) {
-  assert.equal(view.view.options.webPreferences.webviewTag, false, 'native views must not enable DOM webview popups')
+  assert.equal(view.view.options.webPreferences.webviewTag, true, '<webview> guests are first-class webviews')
 }
 console.log(JSON.stringify(result))

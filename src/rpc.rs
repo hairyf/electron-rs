@@ -331,6 +331,9 @@ pub mod window {
     pub prevent_overflow: Option<PreventOverflow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<Theme>,
+    /// Enables the `<webview>` tag for pages in this window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webview_tag: Option<bool>,
     #[serde(flatten)]
     pub additional: BTreeMap<String, Value>,
   }
@@ -872,6 +875,21 @@ mod tests {
     let request: webview::Create = serde_json::from_value(params.clone()).unwrap();
     assert_eq!(request.config.additional["customSetting"], 123);
     round_trip(request, "webview.create", params);
+  }
+
+  #[test]
+  fn webview_tag_is_typed_on_window_configs_only() {
+    let params = json!({"windowId": 2, "window": {"webviewTag": false}});
+    let request: window::Create = serde_json::from_value(params.clone()).unwrap();
+    assert_eq!(request.window.webview_tag, Some(false));
+    assert!(request.window.additional.is_empty());
+    round_trip(request, "window.create", params);
+    let absent: window::Create = serde_json::from_value(json!({"windowId": 2})).unwrap();
+    assert_eq!(absent.window.webview_tag, None);
+    assert_eq!(
+      serde_json::to_value(absent).unwrap(),
+      json!({"windowId": 2, "window": {}})
+    );
   }
 
   fn response<R: RpcRequest>(value: Value) -> R::Response {

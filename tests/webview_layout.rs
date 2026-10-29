@@ -106,7 +106,7 @@ fn four_native_children_keep_url_ownership_and_resize_without_gaps_or_drift() {
             child["preferences"],
             json!({
                 "contextIsolation": true, "sandbox": true, "nodeIntegration": false,
-                "nodeIntegrationInSubFrames": true, "webviewTag": false, "preload": "preload.cjs",
+                "nodeIntegrationInSubFrames": true, "webviewTag": true, "preload": "preload.cjs",
                 "javascript": true, "devTools": true, "backgroundThrottling": true
             })
         );
@@ -362,7 +362,7 @@ fn creation_uses_nested_config_and_applies_webview_preferences_before_navigation
     ] {
         assert_eq!(
             observed[target]["preferences"],
-            json!({ "javascript": false, "devTools": false, "backgroundThrottling": false, "userAgent": null, "webviewTag": false }),
+            json!({ "javascript": false, "devTools": false, "backgroundThrottling": false, "userAgent": null, "webviewTag": true }),
             "preferences for {target}"
         );
         assert_eq!(
@@ -376,7 +376,7 @@ fn creation_uses_nested_config_and_applies_webview_preferences_before_navigation
     }
     assert_eq!(
         observed["defaults"],
-        json!({ "javascript": true, "devTools": true, "backgroundThrottling": true, "userAgent": null, "webviewTag": false })
+        json!({ "javascript": true, "devTools": true, "backgroundThrottling": true, "userAgent": null, "webviewTag": true })
     );
     assert_eq!(
         observed["flat"],
@@ -613,8 +613,8 @@ fn native_policy_covers_preferences_popup_cleanup_explicit_close_and_disconnect(
     assert_eq!(
         observed["roots"],
         json!({
-            "mainOptions": false, "mainView": false, "child": false,
-            "popupOptions": false, "popupView": false,
+            "mainOptions": true, "mainView": true, "child": true,
+            "popupOptions": true, "popupView": true,
         })
     );
     assert_eq!(
@@ -761,4 +761,51 @@ fn macos_restore_waits_for_native_completion_before_hide() {
     assert_eq!(observed["hidden"], false);
     assert_eq!(observed["shown"], true);
     assert_eq!(observed["timers"], 0);
+}
+
+#[test]
+fn webview_tag_guests_are_registered_adopted_and_cleaned_up() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["guest-webview"],
+    ))
+    .unwrap();
+
+    assert_eq!(observed["disabled"], false, "webviewTag: false must reach the window");
+    assert_eq!(observed["defaults"], true, "the runtime enables <webview> by default");
+    assert_eq!(
+        observed["attached"]["preferences"],
+        json!({
+            "preload": "preload.cjs", "contextIsolation": true, "sandbox": true,
+            "nodeIntegration": false, "webviewTag": true,
+        })
+    );
+    assert_eq!(observed["attached"]["idIsGuestRange"], true);
+    assert_eq!(observed["attached"]["adoptedByContents"], true);
+    assert_eq!(observed["attached"]["main"], false);
+    assert_eq!(observed["attached"]["contents"], true);
+    assert_eq!(observed["attached"]["hasView"], false, "Chromium keeps the guest's view");
+    assert_eq!(observed["attached"]["childViews"], 1, "no duplicate attach");
+    assert_eq!(observed["attached"]["policyAttached"], true);
+    assert_eq!(observed["attached"]["windowMapped"], 2);
+    assert_eq!(
+        observed["attached"]["events"],
+        json!([{ "event": "webview.attached", "params": {
+            "webviewId": 1_048_576, "windowId": 2, "contentsId": 3, "url": "",
+        } }])
+    );
+    assert_eq!(observed["attached"]["duplicateIgnored"], 2);
+    assert_eq!(
+        observed["cleaned"],
+        json!({ "mapped": false, "webviews": 1, "events": [
+            { "event": "webview.closed", "params": { "webviewId": 1_048_576 } },
+        ] })
+    );
+    assert_eq!(
+        observed["destroyed"]["events"],
+        json!([
+            { "event": "webview.closed", "params": { "webviewId": 11 } },
+            { "event": "window.closed", "params": { "windowId": 2 } },
+        ])
+    );
 }

@@ -344,6 +344,38 @@ async function preload() {
     trafficLightPosition: window.options.trafficLightPosition, tabbingIdentifier: window.options.tabbingIdentifier,
   }
 }
+async function guest() {
+  const hostContents = window.webContents
+  const preferences = {}
+  hostContents.emit('will-attach-webview', {}, preferences)
+  const contents = new Contents()
+  const before = messages.length
+  hostContents.emit('did-attach-webview', {}, contents)
+  const attached = messages.slice(before).filter((message) => message.event === 'webview.attached')
+  const webviewId = attached[0]?.params.webviewId
+  const mapped = runtime.state.webviewByContents.get(contents.id)
+  const ipc = ipcListeners.get('tauri-ipc')
+  const at = messages.length
+  ipc({ sender: contents, senderFrame: contents.mainFrame }, 'guest message')
+  const ipcMessages = messages.slice(at).filter((message) => message.event === 'ipc.message')
+  const navigation = begin(contents, 'mainFrame')
+  runtime.handle('webview.navigationResponse', { id: navigation.request.id, allow: true })
+  const fetched = await ipcHandlers.get('tauri-ipc-fetch')({ sender: contents, senderFrame: contents.mainFrame }, {
+    url: 'ipc://localhost/guest', method: 'POST', headers: [], body: Uint8Array.of(7),
+  })
+  const events = messages.slice(before).map((message) => message.event)
+  contents.close()
+  const closed = messages.slice(-1)[0]
+  return {
+    webviewId, mapped, sameAsAttached: mapped === webviewId, guestRange: webviewId >= 1 << 20,
+    preferences: {
+      preload: path.basename(preferences.preload ?? ''), contextIsolation: preferences.contextIsolation,
+      sandbox: preferences.sandbox, nodeIntegration: preferences.nodeIntegration, webviewTag: preferences.webviewTag,
+    },
+    ipcMessages, navigation: navigationState(navigation), fetched: { status: fetched.status, body: Array.from(fetched.body ?? []) },    events, closed: { event: closed.event, params: closed.params },
+    remaining: runtime.state.webviewByContents.has(contents.id),
+  }
+}
 function permissions() {
   const decisions = []
   for (const [permission, details, response, contents] of [
@@ -482,7 +514,7 @@ try {
   for (const contents of [window.webContents, child.webContents]) {
     for (const listener of contents.listeners('destroyed')) lifecycleDestroyedListeners.add(listener)
   }
-  const scenarios = { navigation, preload, permissions, sessions }
+  const scenarios = { navigation, preload, permissions, sessions, guest }
   const scenario = scenarios[process.argv[2]]
   if (typeof scenario !== 'function') throw new Error(`unknown webview scenario: ${process.argv[2]}`)
   console.log(JSON.stringify(await scenario()))

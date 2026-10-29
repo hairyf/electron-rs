@@ -27,6 +27,7 @@ export interface WindowConfig extends Record<string, unknown> {
   hiddenTitle?: boolean; trafficLightPosition?: { x: number; y: number }
   visibleOnAllWorkspaces?: boolean; contentProtected?: boolean
   preventOverflow?: boolean | { width?: number; height?: number }; theme?: string | null
+  webviewTag?: boolean
 }
 export interface WindowMenuItem {
   type?: 'separator'; label?: string; enabled?: boolean; accelerator?: string
