@@ -341,6 +341,7 @@ fn prepare_bridge() {
   let output = block_on(async { builder.node(&["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,platform:process.platform,arch:process.arch,answer:6*7}))"])
     .expect("run the staged real binary in Node mode").wait_with_output().await.unwrap() });
   assert!(output.status.success(), "{:?}", output);
+  support::assert_node_stderr(&output.stderr, b"");
   let result: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert_eq!(
     result,
