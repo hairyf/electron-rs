@@ -447,12 +447,50 @@ pub(crate) fn cached_dist(version: &str, target: &DistributionTarget) -> Option<
   verified_dist(&dist, version, target)
 }
 
+/// Cargo runs the build scripts of a build-dependency and a dependency in parallel, and both
+/// prepare the same shared cache. One writer at a time keeps publication atomic for readers.
+struct CacheLock {
+  path: PathBuf,
+}
+
+impl Drop for CacheLock {
+  fn drop(&mut self) {
+    let _ = fs::remove_file(&self.path);
+  }
+}
+
+fn lock_cache(cache: &Path) -> Result<CacheLock, Error> {
+  let path = cache.join(".electron-rs.lock");
+  let stale = std::time::Duration::from_secs(600);
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+  loop {
+    match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+      Ok(_) => return Ok(CacheLock { path }),
+      Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+        if fs::metadata(&path).and_then(|meta| meta.modified()).ok()
+          .and_then(|modified| modified.elapsed().ok())
+          .is_some_and(|age| age > stale)
+        {
+          let _ = fs::remove_file(&path);
+          continue;
+        }
+        if std::time::Instant::now() >= deadline {
+          return Err(format!("timed out waiting for {}", path.display()).into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+      }
+      Err(error) => return Err(Error::with_source(format!("create {}", path.display()), error)),
+    }
+  }
+}
+
 /// Download and unpack only at build time, verifying before publishing the cache.
 pub(crate) fn download(version: &str, target: &DistributionTarget) -> Result<PathBuf, Error> {
   let cache = cache_root().ok_or("no cache directory")?;
   let base = format!("https://github.com/electron/electron/releases/download/v{version}");
   let name = artifact(version, target);
   fs::create_dir_all(&cache).map_err(|error| Error::with_source(format!("create {}", cache.display()), error))?;
+  let _lock = lock_cache(&cache)?;
   let archive = cache.join(&name);
   let dist = cache.join(format!("{}-{}", target.platform, target.arch)).join(version);
   if let Some(dist) = verified_dist(&dist, version, target) { return Ok(dist); }
@@ -480,6 +518,11 @@ pub(crate) fn download(version: &str, target: &DistributionTarget) -> Result<Pat
     target.verify_binary(&stage.join(target.executable()))?;
     if !version_matches(&stage, version) {
       return Err(format!("{name} has no matching Electron {version} version evidence").into());
+    }
+    // A published distribution is never moved aside: another build may be reading it.
+    if verified_dist(&dist, version, target).is_some() {
+      let _ = fs::remove_dir_all(&stage);
+      return Ok(dist);
     }
     match replace_directory(&stage, &dist) {
       Ok(Some(warning)) => eprintln!("[electron] {warning}"),
