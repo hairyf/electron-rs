@@ -117,6 +117,7 @@ class Window extends EventEmitter {
   get webContents() { return this.contentView.children[0]?.webContents }
   show() {}
   isDestroyed() { return false }
+  isMinimized() { return false }
   loadURL(url) { return this.webContents.loadURL(url) }
   getBounds() { return { ...this.bounds } }
   getContentBounds() { return { ...this.bounds } }
