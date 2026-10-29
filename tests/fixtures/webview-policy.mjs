@@ -105,6 +105,7 @@ class Window extends EventEmitter {
   constructor(options) {
     super()
     this.options = options
+    this.destroyed = false
     this.bounds = { x: 0, y: 0, width: options.width, height: options.height }
     const views = []
     this.contentView = {
@@ -116,8 +117,13 @@ class Window extends EventEmitter {
   }
   get webContents() { return this.contentView.children[0]?.webContents }
   show() {}
-  isDestroyed() { return false }
+  isDestroyed() { return this.destroyed }
   isMinimized() { return false }
+  destroy() {
+    if (this.destroyed) return
+    this.destroyed = true
+    this.emit('closed')
+  }
   loadURL(url) { return this.webContents.loadURL(url) }
   getBounds() { return { ...this.bounds } }
   getContentBounds() { return { ...this.bounds } }
