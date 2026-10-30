@@ -33,7 +33,7 @@ pub struct PreparedDistribution {
 }
 
 /// Default Electron release used by the Tauri runtime.
-pub const DEFAULT_VERSION: &str = "45.0.0";
+pub const DEFAULT_VERSION: &str = "44.7.0";
 
 /// Target platform name used in Electron release archives.
 pub fn platform() -> String { acquisition::platform() }
@@ -206,17 +206,17 @@ impl ElectronBuilder {
     acquisition::output_directory(self.output.as_deref(), &DistributionTarget::current()?)
   }
 
-  /// Spawn the prepared binary in Node mode without starting the RPC bridge.
-  /// Returns the native child with piped stdout/stderr; requires a Tokio I/O runtime.
-  pub fn node(&self, args: &[&str]) -> io::Result<tokio::process::Child> {
-    node(self.binary().map_err(io::Error::other)?, args)
+  /// Build a command for the prepared binary in Node mode without starting the RPC bridge.
+  /// The caller chains arguments, working directory and environment, then spawns.
+  pub fn node(&self) -> io::Result<tokio::process::Command> {
+    Ok(node(self.binary().map_err(io::Error::other)?))
   }
 
-  /// Run the prepared binary in Electron mode without starting the RPC bridge.
-  /// Clears `ELECTRON_RUN_AS_NODE`; nonzero exits return `Ok(Output)`.
-  pub fn electron(&self, args: &[&str]) -> io::Result<Output> {
+  /// Build a command for the prepared binary in Electron mode without starting the RPC bridge.
+  /// Clears `ELECTRON_RUN_AS_NODE`; the caller chains arguments, directory and environment.
+  pub fn electron(&self) -> io::Result<tokio::process::Command> {
     let binary = self.binary().map_err(io::Error::other)?;
-    electron(&binary, args)
+    Ok(electron(&binary))
   }
 
   fn expand_resources(&self, path: &Path) -> Result<PathBuf, Error> {
@@ -267,26 +267,39 @@ macro_rules! electron_binary {
   }};
 }
 
-/// Spawn an Electron binary in Node mode without starting the RPC bridge.
-/// Returns the native Tokio child: read its stdout/stderr pipes live, wait for
-/// output, or kill it using Tokio's APIs. Stdin is closed; dropping a running
-/// child requests termination. Requires a Tokio runtime with I/O enabled.
-pub fn node(binary: impl AsRef<Path>, args: &[&str]) -> io::Result<tokio::process::Child> {
+/// Build a command that runs an Electron binary in Node mode.
+///
+/// The returned command already carries `ELECTRON_RUN_AS_NODE=1`, piped
+/// stdout/stderr, null stdin and kill-on-drop; the caller chains the arguments,
+/// working directory and environment it needs, then spawns. Requires a Tokio
+/// runtime with I/O enabled.
+pub fn node(binary: impl AsRef<Path>) -> tokio::process::Command {
   let mut command = tokio::process::Command::new(binary.as_ref());
-  command.args(args).env("ELECTRON_RUN_AS_NODE", "1")
+  command.env("ELECTRON_RUN_AS_NODE", "1")
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped())
     .kill_on_drop(true);
   #[cfg(windows)]
   command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-  command.spawn()
+  command
 }
 
-/// Run an Electron binary normally, explicitly clearing `ELECTRON_RUN_AS_NODE`.
-/// Blocks until exit; nonzero exits return `Ok(Output)` with both output streams.
-pub fn electron(binary: impl AsRef<Path>, args: &[&str]) -> io::Result<Output> {
-  run_command(binary.as_ref(), args)
+/// Build a command that runs an Electron binary normally, with
+/// `ELECTRON_RUN_AS_NODE` explicitly cleared.
+///
+/// Carries piped stdout/stderr and null stdin like [`node`], so the caller can
+/// await its output. It deliberately keeps the workspace directory and the
+/// inherited environment; chain both when the child needs its own.
+pub fn electron(binary: impl AsRef<Path>) -> tokio::process::Command {
+  let mut command = tokio::process::Command::new(binary.as_ref());
+  command.env_remove("ELECTRON_RUN_AS_NODE")
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+  #[cfg(windows)]
+  command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+  command
 }
 
 fn electron_binary_for(path: &Path, target: &DistributionTarget) -> Result<PathBuf, Error> {
@@ -597,16 +610,16 @@ mod tests {
   #[tokio::test]
   async fn node_preserves_process_status_and_both_output_streams() {
     let binary = std::env::current_exe().unwrap();
-    let output = node(&binary, &["--exact", "tests::node_worker", "--nocapture"]).unwrap().wait_with_output().await.unwrap();
+    let output = node(&binary).args(["--exact", "tests::node_worker", "--nocapture"]).spawn().unwrap().wait_with_output().await.unwrap();
     assert_eq!(output.status.code(), Some(23));
     assert!(String::from_utf8_lossy(&output.stdout).contains("node stdout"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("node stderr"));
     let missing = acquisition::unique_sibling(&Path::new(env!("CARGO_MANIFEST_DIR")).join("target/missing-node"), "test");
-    assert_eq!(node(&missing, &[]).unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert_eq!(node(&missing).spawn().unwrap_err().kind(), io::ErrorKind::NotFound);
   }
 
-  #[test]
-  fn electron_clears_inherited_node_mode_and_preserves_output() {
+  #[tokio::test]
+  async fn electron_clears_inherited_node_mode_and_preserves_output() {
     let binary = std::env::current_exe().unwrap();
     // Isolate the inherited variable instead of mutating parallel tests' environment.
     if std::env::var_os("ELECTRON_RS_COMMAND_TEST").is_none() {
@@ -617,12 +630,12 @@ mod tests {
       assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
       return;
     }
-    let output = run_command(&binary, &["--exact", "tests::node_worker", "--nocapture"]).unwrap();
+    let output = electron(&binary).args(["--exact", "tests::node_worker", "--nocapture"]).spawn().unwrap().wait_with_output().await.unwrap();
     assert_eq!(output.status.code(), Some(23));
     assert!(String::from_utf8_lossy(&output.stdout).contains("electron stdout"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("electron stderr"));
     assert_eq!(std::env::var_os("ELECTRON_RUN_AS_NODE").as_deref(), Some(std::ffi::OsStr::new("1")));
     let missing = acquisition::unique_sibling(&Path::new(env!("CARGO_MANIFEST_DIR")).join("target/missing-electron"), "test");
-    assert_eq!(run_command(&missing, &[]).unwrap_err().kind(), io::ErrorKind::NotFound);
+    assert_eq!(electron(&missing).spawn().unwrap_err().kind(), io::ErrorKind::NotFound);
   }
 }

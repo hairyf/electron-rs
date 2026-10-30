@@ -338,8 +338,7 @@ fn prepare_bridge() {
     fs::read(directory.join("electron-rs.json")).unwrap(),
     marker
   );
-  let output = block_on(async { builder.node(&["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,platform:process.platform,arch:process.arch,answer:6*7}))"])
-    .expect("run the staged real binary in Node mode").wait_with_output().await.unwrap() });
+  let output = block_on(async { builder.node().unwrap().args(["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,platform:process.platform,arch:process.arch,answer:6*7}))"]).spawn().expect("run the staged real binary in Node mode").wait_with_output().await.unwrap() });
   assert!(output.status.success(), "{:?}", output);
   support::assert_node_stderr(&output.stderr, b"");
   let result: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -348,16 +347,22 @@ fn prepare_bridge() {
     json!({"electron":DEFAULT_VERSION,"platform":platform(),"arch":arch(),"answer":42})
   );
   let failed = block_on(async { builder
-    .node(&[
+    .node()
+    .unwrap()
+    .args([
       "-e",
       "process.stderr.write('bridge-node-error');process.exit(23)",
     ])
+    .spawn()
     .expect("collect nonzero Node output").wait_with_output().await.unwrap() });
   assert_eq!(failed.status.code(), Some(23));
   assert!(failed.stdout.is_empty());
   support::assert_node_stderr(&failed.stderr, b"bridge-node-error");
   let silent = block_on(async { builder
-    .node(&["-e", "process.exit(17)"])
+    .node()
+    .unwrap()
+    .args(["-e", "process.exit(17)"])
+    .spawn()
     .expect("collect silent Node failure").wait_with_output().await.unwrap() });
   assert_eq!(silent.status.code(), Some(17));
   assert!(silent.stdout.is_empty());
@@ -416,14 +421,13 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
   use electron_rs::OutputStream;
 
   let general = electron.subscribe();
-  let oracle = block_on(async { electron_rs::node(binary, &["-e", "process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));"])
-    .expect("direct connected Node binary-output oracle").wait_with_output().await.unwrap() });
+  let oracle = block_on(async { electron_rs::node(binary).args(["-e", "process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));"]).spawn().expect("direct connected Node binary-output oracle").wait_with_output().await.unwrap() });
   assert!(oracle.status.success(), "{oracle:?}");
   support::assert_node_stderr(&oracle.stderr, &[255, 0, 65]);
   block_on(async {
     // Node forwards native CLI args to another PID; run keeps the existing main.
     let identity = "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,electron:process.versions.electron,nodeMode:process.env.ELECTRON_RUN_AS_NODE}));";
-    let node = electron.node(&["-e", identity]).unwrap().wait_with_output().await.unwrap();
+    let node = electron.node().args(["-e", identity]).spawn().unwrap().wait_with_output().await.unwrap();
     assert!(node.status.success(), "{node:?}");
     support::assert_node_stderr(&node.stderr, b"");
     let node: Value = serde_json::from_slice(&node.stdout).unwrap();
@@ -443,10 +447,10 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     assert_eq!(main["threadId"], 0);
     assert_eq!(main["ready"], true);
     assert_eq!(main["electron"], DEFAULT_VERSION);
-    let version = electron_rs::electron(binary, &["--version"]).unwrap();
+    let version = block_on(electron_rs::electron(binary).args(["--version"]).output()).unwrap();
     assert!(version.status.success(), "{version:?}");
     assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), format!("v{DEFAULT_VERSION}"));
-    let printed = electron.node(&["-p", "6 * 7"]).unwrap().wait_with_output().await.unwrap();
+    let printed = electron.node().args(["-p", "6 * 7"]).spawn().unwrap().wait_with_output().await.unwrap();
     assert!(printed.status.success(), "{printed:?}");
     assert_eq!(printed.stdout, b"42\n");
     support::assert_node_stderr(&printed.stderr, b"");
@@ -457,7 +461,7 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"unlimited");
     assert!(output.stderr.is_empty());
-    let node = electron.node(&["-e", "if(process.argv[1]!=='argument with spaces'||process.argv[2]!=='雪 🦀')throw new Error('arguments changed');process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));", "--", "argument with spaces", "雪 🦀"]).unwrap().wait_with_output().await.unwrap();
+    let node = electron.node().args(["-e", "if(process.argv[1]!=='argument with spaces'||process.argv[2]!=='雪 🦀')throw new Error('arguments changed');process.stdout.write(Buffer.from([0,128,255,10]));process.stderr.write(Buffer.from([255,0,65]));", "--", "argument with spaces", "雪 🦀"]).spawn().unwrap().wait_with_output().await.unwrap();
     assert!(node.status.success(), "{node:?}");
     assert_eq!(node.stdout, oracle.stdout);
     support::assert_node_stderr(&node.stderr, &[255, 0, 65]);
@@ -466,7 +470,7 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, oracle.stdout);
     assert_eq!(output.stderr, [255, 0, 65]);
-    let failed = electron.node(&["-e", "process.exit(17)"]).unwrap().wait_with_output().await.unwrap();
+    let failed = electron.node().args(["-e", "process.exit(17)"]).spawn().unwrap().wait_with_output().await.unwrap();
     assert_eq!(failed.status.code(), Some(17));
     assert!(failed.stdout.is_empty());
     support::assert_node_stderr(&failed.stderr, b"");
@@ -660,16 +664,18 @@ fn real_bridge() {
     let _ = callback_tx.send(event);
   });
   real_commands(electron, &binary);
-  let output = block_on(async { electron_rs::node(&binary, &["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,answer:21*2,page:Buffer.from(process.argv[1]).toString('base64')}))", PAGE]).unwrap().wait_with_output().await.unwrap() });
+  let output = block_on(async { electron_rs::node(&binary).args(["-e", "process.stdout.write(JSON.stringify({electron:process.versions.electron,answer:21*2,page:Buffer.from(process.argv[1]).toString('base64')}))", PAGE]).spawn().unwrap().wait_with_output().await.unwrap() });
   assert!(output.status.success(), "{:?}", output);
   support::assert_node_stderr(&output.stderr, b"");
   let node: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert_eq!(node["electron"], DEFAULT_VERSION);
   assert_eq!(node["answer"], 42);
-  let failed = block_on(async { electron_rs::node(&binary, &[
+  let failed = block_on(async { electron_rs::node(&binary)
+    .args([
       "-e",
       "process.stderr.write('connected-node-error');process.exit(23)",
     ])
+    .spawn()
     .expect("collect connected Node failure output").wait_with_output().await.unwrap() });
   assert_eq!(failed.status.code(), Some(23));
   assert!(failed.stdout.is_empty());

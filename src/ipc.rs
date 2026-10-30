@@ -406,11 +406,11 @@ impl Electron {
       .map_err(|error| Error::with_source("Electron RPC writer failed", error))?
   }
 
-  /// Spawn this client's binary in Node mode, without RPC.
-  /// Exactly [`crate::node`], returning a native Tokio child with stdout/stderr
-  /// pipes and kill-on-drop enabled. Requires a Tokio I/O runtime.
-  pub fn node(&self, args: &[&str]) -> io::Result<tokio::process::Child> {
-    crate::node(&self.binary, args)
+  /// Build a command that runs this client's binary in Node mode, without RPC.
+  /// Exactly [`crate::node`]: carries `ELECTRON_RUN_AS_NODE=1`, piped stdout/stderr
+  /// and kill-on-drop. Chain arguments and environment, then spawn.
+  pub fn node(&self) -> tokio::process::Command {
+    crate::node(&self.binary)
   }
 
   /// Run an async function body on the connected Electron main thread.
@@ -772,7 +772,7 @@ mod tests {
     let (mut electron, _peer, _reader) = loopback(READY);
     Arc::get_mut(&mut electron).unwrap().binary = std::env::current_exe().unwrap();
     // The existing helper executable prints its inherited mode and exits 23.
-    let output = electron.node(&["--exact", "tests::node_worker", "--nocapture"]).unwrap().wait_with_output().await.unwrap();
+    let output = electron.node().args(["--exact", "tests::node_worker", "--nocapture"]).spawn().unwrap().wait_with_output().await.unwrap();
     assert_eq!(output.status.code(), Some(23));
     assert!(String::from_utf8_lossy(&output.stdout).contains("node stdout"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("node stderr"));
