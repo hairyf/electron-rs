@@ -12,7 +12,7 @@ pub mod rpc;
 #[cfg(windows)]
 mod pe;
 
-use std::{fs, io, path::{Path, PathBuf}, process::{Command as ProcessCommand, Output}};
+use std::{fs, io, path::{Path, PathBuf}, process::{Command as ProcessCommand}};
 use acquisition::DistributionTarget;
 pub use command::{Command, CommandChunk, OutputStream};
 pub use ipc::{Electron, Event, RpcRequest};
@@ -397,17 +397,6 @@ fn compile_native_assets(dir: &Path, target: &DistributionTarget) -> Result<(), 
     return Err(format!("AppKit bridge signing failed ({}): {}", output.status, String::from_utf8_lossy(&output.stderr)).into());
   }
   Ok(())
-}
-
-fn run_command(binary: &Path, args: &[&str]) -> io::Result<Output> {
-  let mut command = ProcessCommand::new(binary);
-  command.args(args).env_remove("ELECTRON_RUN_AS_NODE");
-  #[cfg(windows)]
-  {
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-  }
-  command.output()
 }
 
 #[cfg(test)]
