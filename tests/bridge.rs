@@ -447,7 +447,7 @@ fn real_commands(electron: &Arc<Electron>, binary: &Path) {
     assert_eq!(main["threadId"], 0);
     assert_eq!(main["ready"], true);
     assert_eq!(main["electron"], DEFAULT_VERSION);
-    let version = block_on(electron_rs::electron(binary).args(["--version"]).output()).unwrap();
+    let version = electron_rs::electron(binary).args(["--version"]).output().await.unwrap();
     assert!(version.status.success(), "{version:?}");
     assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), format!("v{DEFAULT_VERSION}"));
     let printed = electron.node().args(["-p", "6 * 7"]).spawn().unwrap().wait_with_output().await.unwrap();
