@@ -10,7 +10,7 @@ use electron_rs::{electron_binary, node, DEFAULT_VERSION};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-  let output = node(electron_binary!(None::<&Path>)?, &[
+  let output = node(electron_binary!(None::<&Path>)?).args([
     "-e",
     r#"
     process.stdout.write(JSON.stringify({
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }) + '\n');
     process.stderr.write('real Node stderr\n');
   "#,
-  ])?.wait_with_output().await?;
+  ]).spawn()?.wait_with_output().await?;
   io::stdout().write_all(&output.stdout)?;
   io::stderr().write_all(&output.stderr)?;
   eprintln!("status: {}", output.status);

@@ -14,9 +14,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let binary = electron_binary!(None::<&Path>)?;
   let client = Electron::new(binary, 0).await?;
   // Node is a real standalone Node-mode process, not a Worker or an RPC.
-  let node = client.node(&[
+  let node = client.node().args([
     "-e", "const {isMainThread,threadId}=require('node:worker_threads');console.log(JSON.stringify({pid:process.pid,isMainThread,threadId,nodeMode:process.env.ELECTRON_RUN_AS_NODE}));",
-  ])?;
+  ]).spawn()?;
   let main = client.run(r#"
     const { app } = require('electron');
     const { isMainThread, threadId } = require('node:worker_threads');
