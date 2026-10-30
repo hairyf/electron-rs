@@ -87,11 +87,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ### Node mode
 
-`client.node(args)` is `node(client.binary, args)`:
+`client.node()` is `node(client.binary)`, a `tokio::process::Command` you chain arguments onto and spawn:
 
 ```rust
-let output = client.node(&["-p", "process.versions.node"])?
-    .wait_with_output().await?;
+let output = client.node().args(["-p", "process.versions.node"])
+    .spawn()?.wait_with_output().await?;
 assert!(output.status.success());
 ```
 
@@ -100,12 +100,12 @@ Live output and explicit cancellation, from the native child:
 ```rust
 use tokio::io::AsyncReadExt;
 
-let mut child = client.node(&["-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)"])?;
+let mut child = client.node().args(["-e", "process.stdout.write('ready'); setInterval(() => {}, 1000)"]).spawn()?;
 let mut stdout = child.stdout.take().expect("piped stdout");
 let mut ready = [0; 5];
 stdout.read_exact(&mut ready).await?; // Arrives while the process is still running.
 assert_eq!(&ready, b"ready");
-child.kill().await?; // Terminates and waits for the direct child.
+child.kill().await?;
 ```
 
 - plain Tokio `Command::spawn()` with `ELECTRON_RUN_AS_NODE=1`, null stdin, piped output, `kill_on_drop(true)` — no wrapper, RPC, or Worker; needs a Tokio runtime with I/O enabled (`enable_all()` when manual)
