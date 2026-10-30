@@ -383,10 +383,19 @@ export class Window extends EventEmitter<WindowEvents> {
       if (this.native.isMaximized()) this.native.unmaximize()
       this.native.setBounds({ x: display.bounds.x, y: display.bounds.y, width: Math.min(normal.bounds.width, display.bounds.width), height: Math.min(normal.bounds.height, display.bounds.height) })
     } else if (params.fullscreen && !this.fullscreenBounds) this.fullscreenBounds = { bounds: this.native.getNormalBounds(), maximized: this.native.isMaximized() }
+    const leaving = !params.fullscreen ? this.fullscreenBounds : undefined
     try { await this.transitionFullscreen(params.fullscreen) }
     catch (error) { if (!this.destroyed && !this.native.isFullScreen()) this.restoreFullscreen(); throw error }
-    if (!params.fullscreen) this.restoreFullscreen()
+    if (!params.fullscreen) { this.restoreFullscreen(); if (leaving) await this.settleBounds(leaving) }
     return null
+  }
+  private async settleBounds(normal: FullscreenRestore): Promise<void> {
+    for (let attempt = 0; attempt < 20 && !this.destroyed; attempt++) {
+      const now = this.native.getBounds()
+      if (now.x === normal.bounds.x && now.y === normal.bounds.y && now.width === normal.bounds.width && now.height === normal.bounds.height) return
+      this.native.setBounds(normal.bounds)
+      await new Promise<void>(resolve => setTimeout(resolve, 50))
+    }
   }
   private restoreFullscreen(): void {
     const normal = this.fullscreenBounds
