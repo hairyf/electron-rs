@@ -274,11 +274,13 @@ export class Window extends EventEmitter<WindowEvents> {
   }
   setBackgroundColor(color: string | number[] | undefined): void {
     const transparent = this.config.transparent === true
-    const value = cssColor(color) ?? (transparent ? '#00000000' : '#ffffff')
-    this.native.setBackgroundColor(value)
+    const requested = cssColor(color) ?? (transparent ? '#00000000' : '#ffffff')
+    this.native.setBackgroundColor(requested)
+    const value = transparent ? requested : this.native.getBackgroundColor()
+    if (!transparent) this.native.setBackgroundColor(value)
     this.background = value
     if (this.materialBackground !== undefined) this.materialBackground = value
-    if (this.env.platform === 'linux') this.native.contentView.setBackgroundColor(transparent ? value : this.native.getBackgroundColor())
+    if (this.env.platform === 'linux') this.native.contentView.setBackgroundColor(value)
   }
   setBackgroundMaterial(material: string): void {
     if (!['none', 'acrylic', 'mica', 'tabbed'].includes(material)) throw new Error('invalid background material')
