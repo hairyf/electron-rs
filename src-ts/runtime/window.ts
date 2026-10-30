@@ -354,7 +354,6 @@ export class Window extends EventEmitter<WindowEvents> {
   }
   private async notifyTheme(): Promise<void> { const theme = await this.readTheme(); if (!this.destroyed) this.emit('themeChanged', theme) }
   private async transitionFullscreen(fullscreen: boolean): Promise<void> {
-    if (this.env.platform !== 'darwin') { this.native.setFullScreen(fullscreen); return }
     if (this.native.isFullScreen() === fullscreen) return
     await new Promise<void>((resolve, reject) => {
       let settled = false
