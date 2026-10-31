@@ -128,7 +128,7 @@ export { windows, webviews, downloads, popups, transport, environment, policies,
 ipcMain.handle('tauri-ipc-fetch', async (event, data) => {
   const frame = event.senderFrame
   const webview = webviews.forContents(event.sender.id)
-  if (!frame || frame !== event.sender.mainFrame || frame.origin === 'null' || !webview) throw new Error('unknown IPC sender')
+  if (!frame || frame !== event.sender.mainFrame || frame.origin === 'null' || !webview || !webview.acceptsIpc(frame.url)) throw new Error('unknown IPC sender')
   if (!data || typeof data.url !== 'string' || data.method !== 'POST' || !(data.body instanceof Uint8Array)) throw new Error('invalid IPC request')
   const url = new URL(data.url)
   if (url.username || url.password || url.port || !((url.protocol === 'ipc:' && url.hostname === 'localhost') || (/^https?:$/.test(url.protocol) && url.hostname === 'ipc.localhost'))) throw new Error('invalid IPC request')
@@ -142,7 +142,7 @@ ipcMain.on('tauri-ipc', (event, data) => {
   const frame = event.senderFrame
   if (!frame || frame !== event.sender.mainFrame || frame.origin === 'null' || typeof data !== 'string') return
   const webview = webviews.forContents(event.sender.id)
-  if (!webview) return
+  if (!webview || !webview.acceptsIpc(frame.url)) return
   transport.send('ipc.message', { webviewId: webview.id, url: frame.url, body: data })
 })
 
@@ -158,7 +158,12 @@ transport.onConnect(async () => {
 })
 
 // 连接断开即退出：窗口寿命归 Rust，socket 断了就没有继续存在的理由。
-transport.onClose(() => app.quit())
+transport.onClose(() => {
+  protocols.dispose()
+  policies.dispose()
+  for (const window of windows.all()) window.destroy()
+  app.quit()
+})
 app.on('will-quit', () => { void executions.close() })
 
 // 没有窗口时继续运行，直到 socket 断开。

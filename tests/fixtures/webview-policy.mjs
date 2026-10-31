@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
+import { setImmediate as nextTurn } from 'node:timers/promises'
 import { createRuntime } from './runtime-modules.mjs'
 
 const require = createRequire(new URL('../../assets/main.cjs', import.meta.url))
@@ -376,6 +377,62 @@ async function guest() {
     remaining: runtime.state.webviewByContents.has(contents.id),
   }
 }
+async function managedGuest() {
+  const url = 'http://127.0.0.1:43129/?guest=one'
+  const host = window.webContents
+  await runtime.handle('webview.create', { windowId: 1, webviewId: 41, guestHost: 10, url, initScripts: ['window.guestInitialized = true'] })
+  assert.equal(runtime.webviews.peek(41), undefined)
+  const preferences = {}
+  host.emit('will-attach-webview', { preventDefault() { assert.fail('trusted host rejected') } }, preferences, { src: url })
+  assert.equal(preferences.webviewTag, false)
+  const source = nativeFs.readFileSync(preferences.preload, 'utf8')
+  for (const origin of [new URL(url).origin, 'https://foreign.invalid']) {
+    const page = vm.createContext({ window: { fetch() {} }, location: { href: url, origin }, URL, Request })
+    vm.runInNewContext(source, {
+      process: { isMainFrame: true }, location: { origin }, console,
+      require: () => ({ contextBridge: { exposeInMainWorld(name, value) { page.window[name] = value } },
+        ipcRenderer: {}, webFrame: { executeJavaScript(script) { return vm.runInContext(script, page) } } }),
+    })
+    assert.equal(Boolean(page.window.guestInitialized), origin === new URL(url).origin)
+  }
+  const contents = new Contents()
+  host.emit('did-attach-webview', {}, contents)
+  assert.equal(runtime.webviews.forContents(contents.id), undefined)
+  contents.url = url
+  contents.mainFrame = { url, origin: new URL(url).origin }
+  contents.emit('did-start-navigation', {}, url, false, true)
+  const page = runtime.webviews.get(41)
+  assert.equal(page.contents, contents)
+  contents.executeJavaScript = async script => ({ contentsId: contents.id, script })
+  assert.deepEqual(await runtime.handle('webview.eval', { webviewId: 41, script: 'guest callback' }), { contentsId: contents.id, script: 'guest callback' })
+  const ipc = ipcListeners.get('tauri-ipc')
+  const at = messages.length
+  ipc({ sender: contents, senderFrame: contents.mainFrame }, 'trusted guest')
+  assert.equal(messages[at].params.webviewId, 41)
+  assert.equal(messages[at].params.url, url)
+  const replies = []
+  defaultSession.beforeRequest({ webContentsId: contents.id, resourceType: 'mainFrame', url: 'https://foreign.invalid/' }, reply => replies.push(reply))
+  assert.equal(replies[0].cancel, true)
+  contents.mainFrame = { url: 'https://foreign.invalid/', origin: 'https://foreign.invalid' }
+  const deniedAt = messages.length
+  ipc({ sender: contents, senderFrame: contents.mainFrame }, 'foreign guest')
+  assert.equal(messages.length, deniedAt)
+  await assert.rejects(ipcHandlers.get('tauri-ipc-fetch')({ sender: contents, senderFrame: contents.mainFrame }, {}), /unknown IPC sender/)
+  await runtime.handle('webview.close', { webviewId: 41 })
+  assert.equal(runtime.webviews.peek(41), undefined)
+  await runtime.handle('webview.create', { windowId: 1, webviewId: 42, guestHost: 10, url, initScripts: ['true'] })
+  await runtime.handle('webview.close', { webviewId: 42 })
+  assert.equal(runtime.factory.guestPlans.size, 0)
+  await runtime.handle('webview.create', { windowId: 1, webviewId: 43, guestHost: 10, url, initScripts: ['true'] })
+  host.url = 'https://foreign.invalid/'
+  let prevented = false
+  host.emit('will-attach-webview', { preventDefault() { prevented = true } }, {}, { src: url })
+  assert.equal(prevented, true)
+  host.close()
+  assert.equal(runtime.factory.guestPlans.size, 0)
+  return { identity: 41, callbacks: true, trustedPreload: true, foreignIpcDenied: true, foreignNavigationDenied: true, canceled: true, hostCleanup: true }
+}
+
 function permissions() {
   const decisions = []
   for (const [permission, details, response, contents] of [
@@ -492,6 +549,42 @@ async function sessions() {
   assert.equal(pathCalls.length, pathsBeforePrivate, 'incognito still takes precedence over the child data directory')
   return observed
 }
+async function lifecycle() {
+  runtime.ipc.send = message => messages.push(message)
+  let prevented = false
+  app.emit('before-quit', { preventDefault() { prevented = true } })
+  assert.equal(prevented, true)
+  assert.equal(messages.at(-1).event, 'app.exitRequested')
+  assert.equal(runtime.windows.get(1).requestClose(), true)
+  assert.equal(messages.at(-1).event, 'window.closeRequested')
+  const permission = []
+  defaultSession.permissionRequest(window.webContents, 'geolocation', allow => permission.push(allow), {})
+  const pending = runtime.protocols.fetchIpc(new Request('ipc://localhost/pending'), 10)
+  await nextTurn()
+  assert.equal(runtime.protocols.pending.size, 1)
+  let releaseBody
+  const reading = runtime.protocols.fetchIpc({ url: 'ipc://localhost/reading', method: 'POST', headers: new Headers(), arrayBuffer: () => new Promise(resolve => { releaseBody = resolve }) }, 10)
+  let quits = 0
+  app.quit = () => {
+    quits++
+    let blocked = false
+    app.emit('before-quit', { preventDefault() { blocked = true } })
+    assert.equal(blocked, false)
+    assert.equal(runtime.protocols.pending.size, 0)
+    assert.deepEqual(permission, [false])
+    assert.equal(contentsById.size > 0, true)
+    assert.equal([...contentsById.values()].every(contents => contents.isDestroyed()), true)
+    assert.equal(runtime.windows.all().every(window => window.destroyed), true)
+  }
+  runtime.ipc.close()
+  assert.equal((await pending).status, 499)
+  releaseBody(new ArrayBuffer(0))
+  assert.equal((await reading).status, 0)
+  assert.equal(runtime.protocols.pending.size, 0)
+  runtime.ipc.close()
+  assert.equal(quits, 1)
+  return { quits, pending: runtime.protocols.pending.size, permission, windows: runtime.windows.all().length }
+}
 try {
   runtime.state.installPolicyHandlers(defaultSession)
   const scripts = [
@@ -514,7 +607,7 @@ try {
   for (const contents of [window.webContents, child.webContents]) {
     for (const listener of contents.listeners('destroyed')) lifecycleDestroyedListeners.add(listener)
   }
-  const scenarios = { navigation, preload, permissions, sessions, guest }
+  const scenarios = { navigation, preload, permissions, sessions, guest, lifecycle, 'managed-guest': managedGuest }
   const scenario = scenarios[process.argv[2]]
   if (typeof scenario !== 'function') throw new Error(`unknown webview scenario: ${process.argv[2]}`)
   console.log(JSON.stringify(await scenario()))

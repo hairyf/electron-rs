@@ -5,8 +5,9 @@
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc -p tsconfig.electron.json",
+    "test:lifecycle": "node tests/checks/lifecycle.mjs",
     "test": "pnpm run test:checks && cargo test --locked",
-    "test:checks": "node tests/checks/transport.mjs && node tests/checks/startup.mjs && node tests/checks/commands.mjs && node tests/fixtures/webview-layout.mjs native-interaction && node tests/fixtures/webview-layout.mjs minimized-constraints && node tests/fixtures/webview-layout.mjs guest-webview && node tests/fixtures/webview-policy.mjs guest",
+    "test:checks": "node tests/checks/transport.mjs && node tests/checks/startup.mjs && node tests/checks/commands.mjs && node tests/fixtures/webview-layout.mjs native-interaction && node tests/fixtures/webview-layout.mjs minimized-constraints && node tests/fixtures/webview-layout.mjs guest-webview && node tests/fixtures/webview-policy.mjs guest && node tests/fixtures/webview-policy.mjs managed-guest && node tests/fixtures/webview-policy.mjs lifecycle",
     "test:bridge:prepare": "cargo test --locked --test bridge prepare_bridge -- --ignored --exact --test-threads=1 --nocapture",
     "test:bridge": "cargo test --locked --test bridge real_bridge -- --ignored --exact --test-threads=1 --nocapture"
   },

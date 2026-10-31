@@ -36,6 +36,7 @@ export class Policies {
       const contentsId = details.webContents?.id ?? details.webContentsId
       const webview = contentsId === undefined ? undefined : this.host.webviews.forContents(contentsId)
       const contents = webview?.contents
+      if (webview && ['mainFrame', 'subFrame'].includes(details.resourceType) && !webview.acceptsIpc(details.url)) { callback({ cancel: true }); return }
       if (!contents || !['mainFrame', 'subFrame'].includes(details.resourceType) || !webview?.webviewPolicy?.navigation) { callback({}); return }
       const id = ++this.nextNavigationRequest
       const entry: NavigationEntry = { nativeId: details.id, contents, timer: undefined as unknown as NodeJS.Timeout, onDestroyed: () => finish(false) , finish: (allow, retired = false) => {

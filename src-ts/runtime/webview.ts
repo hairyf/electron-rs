@@ -73,6 +73,11 @@ export class Webview extends EventEmitter<WebviewEvents> {
   get isMain(): boolean { return this.main }
   setMain(main: boolean): void { this.main = main }
   get webviewPolicy(): WebviewPolicy | undefined { return this.policy }
+  get initialUrl(): string { return this.config.url }
+  acceptsIpc(url: string): boolean {
+    if (typeof this.config.ipcOrigin !== 'string') return true
+    try { return new URL(url).origin !== 'null' && new URL(url).origin === this.config.ipcOrigin } catch { return false }
+  }
   private bindEvents(): void {
     const c = this.contents
     c.on('context-menu', this.onContextMenu)

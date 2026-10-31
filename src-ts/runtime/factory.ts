@@ -12,6 +12,7 @@ import { Window, normalizeConstraint, cssColor, type SizeConstraints, type Const
 export interface WindowFactory {
   createWindow(params: Record<string, any>): { windowId: number }
   createWebview(params: Record<string, any>): { webviewId: number }
+  closeWebview(webviewId: number): void
 }
 
 export interface FactoryDependencies {
@@ -29,6 +30,8 @@ type PopupContext = { request: number; opener: Webview }
 
 export class Factory implements WindowFactory {
   private readonly customSessions = new Set<Session>()
+  private readonly guestPlans = new Map<number, { host: Webview; init: WebviewInit; preload: string }>()
+  private readonly guestAttachments = new Map<string, { host: Webview; init: WebviewInit; preload: string }>()
 
   constructor(private readonly deps: FactoryDependencies) {}
 
@@ -95,6 +98,15 @@ export class Factory implements WindowFactory {
     if (!Number.isSafeInteger(webviewId) || this.deps.webviews.peek(webviewId)) throw new Error('invalid or duplicate webview ID')
     const window = this.deps.windows.get(params.windowId)
     const init = { ...params, webviewId } as WebviewInit
+    if (params.guestHost !== undefined) {
+      const host = this.deps.webviews.get(params.guestHost)
+      const origin = new URL(init.url).origin
+      if (host.window !== window || host.adopted || origin === 'null' || [...this.guestPlans.values()].some(plan => plan.host === host && plan.init.url === init.url)) throw new Error('invalid or duplicate guest registration')
+      init.ipcOrigin = origin
+      const preload = this.writeInitPreload(webviewId, params.initScripts, origin)
+      this.guestPlans.set(webviewId, { host, init, preload })
+      return { webviewId }
+    }
     const config = { ...window.configuration, ...Object.fromEntries(Object.entries(params).filter(([, value]) => value != null)) } as WindowConfig
     const targetSession = this.sessionFor(init) ?? this.deps.webviews.main(window)?.contents.session ?? session.defaultSession
     const webPreferences = this.webPreferences(init, config, targetSession)
@@ -110,6 +122,16 @@ export class Factory implements WindowFactory {
       webview.close()
       throw error
     }
+  }
+
+  closeWebview(webviewId: number): void {
+    let pending = this.guestPlans.delete(webviewId)
+    for (const [preload, plan] of this.guestAttachments) {
+      if (plan.init.webviewId === webviewId) { this.guestAttachments.delete(preload); pending = true }
+    }
+    const page = this.deps.webviews.peek(webviewId)
+    if (page) page.close()
+    else if (pending) this.deps.transport.send('webview.closed', { webviewId })
   }
 
   private sessionFor(params?: Params | null): Session | undefined {
@@ -176,13 +198,13 @@ export class Factory implements WindowFactory {
     }
   }
 
-  private writeInitPreload(webviewId?: number, initScripts?: unknown[]): string {
+  private writeInitPreload(webviewId?: number, initScripts?: unknown[], origin?: string): string {
     const scripts = (initScripts ?? []).map((item) => typeof item === 'string' ? { script: item, mainFrameOnly: true } : item)
     if (!scripts.length) return path.join(__dirname, '..', 'preload.cjs')
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tauri-runtime-electron-preload-'))
     const file = path.join(directory, `${webviewId ?? 'guest'}.cjs`)
     app.once('will-quit', () => fs.rmSync(directory, { recursive: true, force: true }))
-    const source = `${fs.readFileSync(path.join(__dirname, '..', 'preload.cjs'), 'utf8')}\nfor (const entry of ${JSON.stringify(scripts)}) {\n  if (entry.mainFrameOnly && !process.isMainFrame) continue\n  try { require('electron').webFrame.executeJavaScript(entry.script) } catch (error) { console.error('init script failed', error) }\n}\n`
+    const source = `${fs.readFileSync(path.join(__dirname, '..', 'preload.cjs'), 'utf8')}\nfor (const entry of ${JSON.stringify(scripts)}) {\n  if (${JSON.stringify(origin ?? null)} && location.origin !== ${JSON.stringify(origin ?? null)}) continue\n  if (entry.mainFrameOnly && !process.isMainFrame) continue\n  try { require('electron').webFrame.executeJavaScript(entry.script) } catch (error) { console.error('init script failed', error) }\n}\n`
     fs.writeFileSync(file, source)
     return file
   }
@@ -210,12 +232,27 @@ export class Factory implements WindowFactory {
     webview.on('titleChanged', (title) => this.deps.transport.send('webview.titleChanged', { webviewId: id, title }))
     webview.on('processGone', (details) => this.deps.transport.send('webview.processGone', { webviewId: id, ...details }))
     webview.on('closed', () => {
+      for (const plan of [...this.guestPlans.values(), ...this.guestAttachments.values()]) {
+        if (plan.host === webview) this.closeWebview(plan.init.webviewId)
+      }
       this.deps.webviews.delete(id)
       this.deps.transport.send('webview.closed', { webviewId: id })
     })
     if (webview.adopted) return
     const contents = webview.contents
-    contents.on('will-attach-webview', (_event, preferences) => this.guestPreferences(webview, preferences))
+    contents.on('will-attach-webview', (event, preferences, params) => {
+      this.guestPreferences(webview, preferences)
+      const plan = [...this.guestPlans.values()].find(plan => plan.host === webview && plan.init.url === params?.src)
+      if (!plan) return
+      const current = new URL(contents.getURL())
+      const initial = new URL(webview.initialUrl)
+      if (!current.host || current.protocol !== initial.protocol || current.host !== initial.host) { event.preventDefault(); return }
+      preferences.preload = plan.preload
+      preferences.webviewTag = false
+      preferences.nodeIntegrationInSubFrames = false
+      this.guestPlans.delete(plan.init.webviewId)
+      this.guestAttachments.set(plan.preload, plan)
+    })
     contents.on('did-attach-webview', (_event, guest) => this.adoptGuest(webview, guest))
   }
 
@@ -227,12 +264,19 @@ export class Factory implements WindowFactory {
     preferences.webviewTag = host.window.configuration.webviewTag ?? true
   }
 
-  private adoptGuest(host: Webview, contents: WebContents): void {
+  private adoptGuest(host: Webview, contents: WebContents, url = contents.getURL()): void {
     if (this.deps.webviews.forContents(contents.id)) return
+    const plans = [...this.guestAttachments.values()].filter(plan => plan.host === host)
+    const plan = plans.find(plan => plan.init.url === url)
+    if (!plan && plans.length && (!url || url === 'about:blank')) {
+      contents.once('did-start-navigation', (_event, nextUrl) => this.adoptGuest(host, contents, nextUrl))
+      return
+    }
     const window = host.window
-    const webviewId = Factory.nextGuestWebviewId++
+    if (plan) this.guestAttachments.delete(plan.preload)
+    const webviewId = plan?.init.webviewId ?? Factory.nextGuestWebviewId++
     const page = new Webview(window, webviewId, undefined,
-      { webviewId, url: contents.getURL(), autoResize: true, policy: host.webviewPolicy },
+      plan?.init ?? { webviewId, url: contents.getURL(), autoResize: true, policy: host.webviewPolicy },
       window.configuration.devtools !== false, contents)
     this.deps.webviews.add(page)
     this.wireWebview(page)

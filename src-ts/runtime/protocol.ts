@@ -100,6 +100,7 @@ export class Protocols {
     if (this.disposed || (scheme === 'ipc' && webviewId === undefined)) return Response.error()
     const id = this.nextRequest++
     const body = Buffer.from(await request.arrayBuffer()).toString('base64')
+    if (this.disposed) return Response.error()
     const headers: Record<string, string> = {}
     request.headers.forEach((value, key) => { headers[key] = value })
     const initiator = (request as Request & { initiatorOrigin?: string }).initiatorOrigin

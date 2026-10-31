@@ -158,7 +158,7 @@ function webviewCommands(ctx: CommandContext): CommandTable {
     'webview.backgroundColor': (p) => { webview(p).setBackgroundColor(p.color); return null },
     'webview.focus': (p) => { webview(p).focus(); return null },
     'webview.print': (p) => webview(p).print(),
-    'webview.close': (p) => { webview(p).close(); return null },
+    'webview.close': (p) => { ctx.factory.closeWebview(p.webviewId); return null },
     'webview.cookies': (p) => webview(p).cookies({ url: p.url }),
     'webview.setCookie': (p) => webview(p).setCookie(p as CookieInit),
     'webview.deleteCookie': (p) => webview(p).deleteCookie({ url: p.url, name: p.name }),
