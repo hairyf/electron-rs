@@ -200,7 +200,7 @@ export class Factory implements WindowFactory {
 
   private writeInitPreload(webviewId?: number, initScripts?: unknown[], origin?: string): string {
     const scripts = (initScripts ?? []).map((item) => typeof item === 'string' ? { script: item, mainFrameOnly: true } : item)
-    if (!scripts.length) return path.join(__dirname, '..', 'preload.cjs')
+    if (!scripts.length && !origin) return path.join(__dirname, '..', 'preload.cjs')
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tauri-runtime-electron-preload-'))
     const file = path.join(directory, `${webviewId ?? 'guest'}.cjs`)
     app.once('will-quit', () => fs.rmSync(directory, { recursive: true, force: true }))

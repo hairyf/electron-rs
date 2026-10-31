@@ -423,6 +423,18 @@ async function managedGuest() {
   await runtime.handle('webview.create', { windowId: 1, webviewId: 42, guestHost: 10, url, initScripts: ['true'] })
   await runtime.handle('webview.close', { webviewId: 42 })
   assert.equal(runtime.factory.guestPlans.size, 0)
+  const simultaneous = [44, 45].map(webviewId => ({ webviewId, url: `${url}&id=${webviewId}`, contents: new Contents() }))
+  for (const guest of simultaneous) {
+    await runtime.handle('webview.create', { windowId: 1, webviewId: guest.webviewId, guestHost: 10, url: guest.url })
+    host.emit('will-attach-webview', { preventDefault() { assert.fail('trusted host rejected') } }, {}, { src: guest.url })
+  }
+  for (const guest of simultaneous) {
+    guest.contents.url = guest.url
+    host.emit('did-attach-webview', {}, guest.contents)
+  }
+  assert.deepEqual(simultaneous.map(guest => runtime.webviews.forContents(guest.contents.id)?.id), [44, 45])
+  for (const { webviewId } of simultaneous) await runtime.handle('webview.close', { webviewId })
+  assert.equal(runtime.factory.guestAttachments.size, 0)
   await runtime.handle('webview.create', { windowId: 1, webviewId: 43, guestHost: 10, url, initScripts: ['true'] })
   host.url = 'https://foreign.invalid/'
   let prevented = false
