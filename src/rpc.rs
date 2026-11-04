@@ -264,6 +264,21 @@ pub mod window {
     },
   }
 
+  /// Windows taskbar identity; other platforms ignore it.
+  ///
+  /// The app id must match the shortcut's AppUserModelID. Windows pins the
+  /// hosting executable with no arguments unless a relaunch command is given,
+  /// which starts the stock Electron binary instead of the application entry.
+  #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+  #[serde(rename_all = "camelCase")]
+  pub struct AppDetails {
+    pub app_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relaunch_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relaunch_display_name: Option<String>,
+  }
+
   /// Common window settings are typed; additional settings remain extensible.
   #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
   #[serde(rename_all = "camelCase")]
@@ -351,6 +366,7 @@ pub mod window {
       #[serde(skip_serializing_if = "Option::is_none")] defer_show: Option<bool>,
       #[serde(skip_serializing_if = "Option::is_none")] window_icon: Option<CreationIcon>,
       #[serde(skip_serializing_if = "Option::is_none")] icon: Option<String>,
+      #[serde(skip_serializing_if = "Option::is_none")] app_details: Option<AppDetails>,
     } => Created, "window.create";
     Ready { window_id: u32 } => (), "window.ready", deferred = true;
     SetTitle { window_id: u32, title: String } => (), "window.setTitle";

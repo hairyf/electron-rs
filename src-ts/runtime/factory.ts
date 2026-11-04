@@ -53,6 +53,7 @@ export class Factory implements WindowFactory {
     const { windowId } = params
     if (!Number.isSafeInteger(windowId) || this.deps.windows.peek(windowId)) throw new Error('invalid or duplicate window ID')
     const config: WindowConfig = params.window ?? params
+    if (params.appDetails !== undefined && config.appDetails === undefined) config.appDetails = params.appDetails
     for (const key of ['width', 'height', 'x', 'y']) {
       const value = config[key]
       if (value != null && (typeof value !== 'number' || !Number.isFinite(value) || (['width', 'height'].includes(key) && value <= 0))) throw new Error('invalid window geometry')
