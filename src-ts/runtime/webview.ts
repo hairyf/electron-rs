@@ -29,6 +29,8 @@ export class Webview extends EventEmitter<WebviewEvents> {
   private nativePopup = false
   private openingDevtools?: Promise<void>
   private evaluationReady?: Promise<void>
+  private generation = 0
+  get documentGeneration(): number { return this.generation }
   private contextMenu?: Menu
   private readonly onContextMenu = (_event: Event, params: ContextMenuParams) => {
     if (this.closed || this.contents.isDestroyed() || this.owner.destroyed) return
@@ -93,7 +95,9 @@ export class Webview extends EventEmitter<WebviewEvents> {
     c.on('did-navigate', (_e, url) => this.emit('navigationCommitted', url))
     c.on('did-navigate-in-page', (_e, url, isMain) => { if (isMain) this.emit('navigationCommitted', url) })
     c.on('dom-ready', () => { if (this.attached) this.syncOwnerState() })
-    c.on('did-start-navigation', (_event, url, inPlace, mainFrame) => { if (mainFrame && !inPlace) this.emit('loadStarted', url) })
+    c.on('did-start-navigation', (_event, url, inPlace, mainFrame) => {
+      if (mainFrame && !inPlace) { this.generation++; this.emit('loadStarted', url) }
+    })
     c.on('did-finish-load', () => this.emit('loadFinished', c.getURL()))
     c.on('did-fail-load', (_event, code, _description, url, mainFrame) => { if (mainFrame && code !== -3) this.emit('loadFailed', url) })
     c.on('page-title-updated', (_e, title) => this.emit('titleChanged', title))
@@ -163,25 +167,30 @@ export class Webview extends EventEmitter<WebviewEvents> {
     if (image.isEmpty()) throw new Error('webview capture returned an empty image')
     return image.toDataURL()
   }
-  async evaluate(script: string): Promise<unknown> {
+  async evaluate(script: string, documentGeneration = this.generation): Promise<unknown> {
     const contents = this.contents
+    if (documentGeneration !== this.generation) throw new Error('webview document replaced before script evaluation')
     if (contents.isDestroyed()) throw new Error('webview destroyed before script evaluation')
     if (!contents.getURL() || contents.isLoadingMainFrame()) {
       this.evaluationReady ??= new Promise<void>((resolve, reject) => {
         const finish = (error?: Error) => {
           contents.removeListener('did-stop-loading', loaded)
           contents.removeListener('destroyed', destroyed)
+          contents.removeListener('did-start-navigation', navigated)
           if (error) reject(error)
           else resolve()
         }
         const loaded = () => finish()
+        const navigated = (_event: unknown, _url: string, inPlace: boolean, mainFrame: boolean) => { if (mainFrame && !inPlace) finish(new Error('webview document replaced before script evaluation')) }
         const destroyed = () => finish(new Error('webview destroyed before script evaluation'))
         contents.once('did-stop-loading', loaded)
         contents.once('destroyed', destroyed)
+        contents.on('did-start-navigation', navigated)
       }).finally(() => { this.evaluationReady = undefined })
       await this.evaluationReady
     }
-    return contents.executeJavaScript(script, true)
+    if (documentGeneration !== this.generation) throw new Error('webview document replaced before script evaluation')
+    return contents.mainFrame.executeJavaScript(script, true)
   }
   snapshot(): WebviewSnapshot {
     const scaleFactor = this.owner.scale, contentBounds = this.owner.native.getContentBounds()

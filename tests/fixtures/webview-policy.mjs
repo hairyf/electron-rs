@@ -416,7 +416,7 @@ async function managedGuest() {
   const page = runtime.webviews.get(41)
   assert.equal(page.id, 41)
   contents.url = url
-  contents.mainFrame = { url, origin: new URL(url).origin }
+  contents.mainFrame = { url, origin: new URL(url).origin, executeJavaScript: script => contents.executeJavaScript(script) }
   assert.equal(page.contents, contents)
   contents.executeJavaScript = async script => ({ contentsId: contents.id, script })
   assert.deepEqual(await runtime.handle('webview.eval', { webviewId: 41, script: 'guest callback' }), { contentsId: contents.id, script: 'guest callback' })

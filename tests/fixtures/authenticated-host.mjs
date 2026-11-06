@@ -98,6 +98,25 @@ try {
   await once(other.contents, 'did-finish-load')
   await other.contents.loadURL(origin)
   assert.equal(received.at(-1).cookie, undefined)
+  const oldDocument = other.documentGeneration
+  await other.contents.loadURL(origin + '/next')
+  await assert.rejects(commands['webview.eval']({ webviewId: 3, script: 'window.staleChannel = true', documentGeneration: oldDocument }), /document replaced/)
+  await assert.rejects(commands['webview.eval']({ webviewId: 3, script: 'window.staleChannel = true', documentGeneration: oldDocument }), /document replaced/)
+  assert.equal(await other.evaluate('typeof window.staleChannel'), 'undefined')
+  slowRequest = Promise.withResolvers()
+  const replacedNavigation = other.contents.loadURL(origin + '/slow').catch(error => error)
+  await slowRequest.promise
+  const replaced = assert.rejects(other.evaluate('window.mustNotCross = true'), /document replaced/)
+  await other.contents.loadURL(origin + '/replacement')
+  await replaced
+  await replacedNavigation
+  assert.equal(await other.evaluate('typeof window.mustNotCross'), 'undefined')
+  const newDocument = other.documentGeneration
+  assert.equal(await commands['webview.eval']({ webviewId: 3, script: '42', documentGeneration: newDocument }), 42)
+  await other.contents.loadURL(origin + '/replacement#same-document')
+  assert.equal(other.documentGeneration, newDocument)
+  assert.equal(await commands['webview.eval']({ webviewId: 3, script: '43', documentGeneration: newDocument }), 43)
+  slowRequest = Promise.withResolvers()
   const navigation = other.contents.loadURL(origin + '/slow')
   const finish = await slowRequest.promise
   const baseline = other.contents.listenerCount('did-stop-loading')

@@ -65,8 +65,8 @@ export class Protocols {
   }
 
   /** Authenticated IPC fetch: unlike session protocol handlers, this has a trusted webview identity. */
-  fetchIpc(request: Request, webviewId: number): Promise<Response> {
-    return this.dispatch('ipc', request, `ipc://localhost${new URL(request.url).pathname}${new URL(request.url).search}`, webviewId)
+  fetchIpc(request: Request, webviewId: number, documentGeneration?: number): Promise<Response> {
+    return this.dispatch('ipc', request, `ipc://localhost${new URL(request.url).pathname}${new URL(request.url).search}`, webviewId, documentGeneration)
   }
 
   /** protocol.respond */
@@ -98,7 +98,7 @@ export class Protocols {
    * 发起一次到 Rust 的请求并等待响应。
    * webviewId 为 undefined 时拒绝 `ipc://`：没带身份的调用无法判定归属。
    */
-  private async dispatch(scheme: string, request: Request, uri = request.url, webviewId?: number): Promise<Response> {
+  private async dispatch(scheme: string, request: Request, uri = request.url, webviewId?: number, documentGeneration?: number): Promise<Response> {
     if (this.disposed || (scheme === 'ipc' && webviewId === undefined)) return Response.error()
     const id = this.nextRequest++
     const body = Buffer.from(await request.arrayBuffer()).toString('base64')
@@ -108,7 +108,7 @@ export class Protocols {
     const initiator = (request as Request & { initiatorOrigin?: string }).initiatorOrigin
     if (typeof initiator === 'string') headers.origin = initiator
     const reply = new Promise<ProtocolResponse>((resolve) => this.pending.set(id, resolve))
-    this.host.transport.send('protocol.request', { id, scheme, webviewId, uri, method: request.method, headers, body })
+    this.host.transport.send('protocol.request', { id, scheme, webviewId, documentGeneration, uri, method: request.method, headers, body })
     const result = await reply
     const status = result.status ?? 200
     const responseHeaders = new Headers(result.headers ?? {})

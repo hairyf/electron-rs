@@ -137,7 +137,7 @@ function webviewCommands(ctx: CommandContext): CommandTable {
     'browser.acquire': (p) => ctx.factory.acquireBrowserGuest(p.webviewId, p.workspace),
     'browser.release': (p) => ctx.factory.releaseBrowserGuest(p.webviewId, p.lease),
     'webview.url': (p) => webview(p).contents.getURL(),
-    'webview.eval': (p) => webview(p).evaluate(p.script),
+    'webview.eval': (p) => webview(p).evaluate(p.script, p.documentGeneration),
     'webview.capture': (p) => webview(p).capture(),
     // 策略应答：id 是策略请求自己的编号，不是这条 RPC 的编号。
     'webview.newWindowResponse': (p) => { ctx.respond(p.id, p.response); return null },

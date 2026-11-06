@@ -636,7 +636,7 @@ pub mod webview {
   requests! {
     Create { window_id: u32, #[serde(flatten)] config: Config } => Created, "webview.create", deferred = true;
     Url { webview_id: u32 } => String, "webview.url";
-    Eval { webview_id: u32, script: String } => Value, "webview.eval", deferred = true;
+    Eval { webview_id: u32, script: String, #[serde(skip_serializing_if = "Option::is_none")] document_generation: Option<u64> } => Value, "webview.eval", deferred = true;
     NewWindowResponse { id: u64, response: NewWindowDecision } => (), "webview.newWindowResponse";
     NavigationResponse { id: u64, allow: bool } => (), "webview.navigationResponse";
     DownloadResponse {
@@ -1127,7 +1127,7 @@ mod tests {
     assert!(window::QueryTheme { window_id: 1 }.deferred());
     assert!(webview::Eval {
       webview_id: 1,
-      script: String::new()
+      script: String::new(), document_generation: None
     }
     .deferred());
     assert!(webview::OpenDevtools { webview_id: 1 }.timeout().as_secs() > 10);
