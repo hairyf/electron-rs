@@ -5,6 +5,8 @@ import { once } from 'node:events'
 
 const require = createRequire(import.meta.url)
 const { app } = require('electron')
+const { Protocols } = require('../../assets/runtime/protocol.cjs')
+Protocols.registerPrivileged(['tauri'])
 import { createHash } from 'node:crypto'
 const home = process.env.AUTHENTICATED_HOST_HOME
 assert.ok(home, 'native fixture requires an isolated userData directory')
@@ -41,18 +43,21 @@ try {
   bootstrap.listen(0, '127.0.0.1'); await once(bootstrap, 'listening')
   const bootstrapUrl = 'http://127.0.0.1:' + bootstrap.address().port
   const { Factory } = require('../../assets/runtime/factory.cjs')
-  const { Protocols } = require('../../assets/runtime/protocol.cjs')
+
   const { Webviews } = require('../../assets/runtime/webview.cjs')
   const { Windows } = require('../../assets/runtime/window.cjs')
   const { Environment } = require('../../assets/runtime/environment.cjs')
   const { createCommands } = require('../../assets/runtime/commands.cjs')
   const webviews = new Webviews(), windows = new Windows()
-  const policies = { install() {}, attach() {} }
+  const policies = { install(target) { target.protocol.handle('tauri', () => new Response('<!doctype html><body>custom bootstrap</body>')) }, attach() {} }
   const transport = { closed: false, send(event) { assert.notEqual(event, 'protocol.request', 'body must never cross Rust') } }
   const protocols = new Protocols({ policies, transport })
+  const { documentOrigin } = require('../../assets/runtime/origin.cjs')
+  assert.equal(documentOrigin('tauri://localhost/'), 'tauri://localhost')
+  for (const opaque of ['about:blank', 'file:///tmp/page', 'data:text/html,page', 'unknown://localhost/']) assert.equal(documentOrigin(opaque), 'null')
   const factory = new Factory({ windows, webviews, policies, protocols, transport, environment: new Environment(webviews), popups: new Map() })
   const commands = createCommands({ webviews, protocols, factory })
-  factory.createWindow({ windowId: 1, window: { visible: false }, webview: { webviewId: 2, url: bootstrapUrl, browserHost: true, authenticatedWebHostSession: true } })
+  factory.createWindow({ windowId: 1, window: { visible: false }, webview: { webviewId: 2, url: 'tauri://localhost/', browserHost: true, authenticatedWebHostSession: true } })
   const owner = webviews.get(2)
   await once(owner.contents, 'did-finish-load')
   console.error('native: bootstrap')

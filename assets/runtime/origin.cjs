@@ -1,0 +1,1 @@
+Object.defineProperty(exports,Symbol.toStringTag,{value:`Module`});const e=/* @__PURE__ */ new Set;function t(t){for(let n of t)/^[a-z][a-z0-9+.-]*$/.test(n)&&e.add(n+`:`)}function n(t){let n=new URL(t);return n.origin===`null`?e.has(n.protocol)&&n.hostname&&!n.username&&!n.password?n.protocol+`//`+n.host:`null`:n.origin}exports.documentOrigin=n,exports.registerStandardSchemes=t;

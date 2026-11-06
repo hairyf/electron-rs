@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { documentOrigin } from './origin'
 import { Menu } from 'electron'
 import type { ContextMenuParams, Cookie, Event, Input, MenuItemConstructorOptions, Rectangle, WebContents, WebContentsView } from 'electron'
 import { cssColor, type Window } from './window'
@@ -81,12 +82,12 @@ export class Webview extends EventEmitter<WebviewEvents> {
   get initialUrl(): string { return this.config.url }
   get authenticatedWebHost(): unknown { return this.config.authenticatedWebHost }
   get browserHost(): boolean { return this.config.browserHost === true }
-  get trustedOrigin(): string { return this.authenticatedOrigin ?? new URL(this.initialUrl).origin }
+  get trustedOrigin(): string { return this.authenticatedOrigin ?? documentOrigin(this.initialUrl) }
   setAuthenticatedOrigin(origin: string): void { this.authenticatedOrigin = origin }
   acceptsIpc(url: string): boolean {
     const origin = this.authenticatedOrigin ?? (this.browserHost ? this.trustedOrigin : this.config.ipcOrigin)
     if (typeof origin !== 'string') return true
-    try { return new URL(url).origin !== 'null' && new URL(url).origin === origin } catch { return false }
+    try { return documentOrigin(url) !== 'null' && documentOrigin(url) === origin } catch { return false }
   }
   private bindEvents(): void {
     const c = this.contents

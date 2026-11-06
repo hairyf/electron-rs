@@ -1,4 +1,5 @@
 import { net, protocol } from 'electron'
+import { registerStandardSchemes } from './origin'
 import { AuthenticatedHosts } from './authenticated-host'
 import type { Protocol, Session } from 'electron'
 import type { Transport } from '../socket/transport'
@@ -52,6 +53,7 @@ export class Protocols {
 
   /** 必须在 app.whenReady() 之前调用；schemes 来自 --tauri-schemes。 */
   static registerPrivileged(schemes: string[]): void {
+    registerStandardSchemes(schemes)
     protocol.registerSchemesAsPrivileged(schemes.filter((scheme, i, all) => /^[a-z][a-z0-9+.-]*$/.test(scheme) && all.indexOf(scheme) === i).map((scheme) => ({ scheme, privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } })))
   }
 
