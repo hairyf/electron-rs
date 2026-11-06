@@ -147,6 +147,7 @@ function webviewCommands(ctx: CommandContext): CommandTable {
       return null
     },
     'webview.permissionResponse': (p) => { ctx.policies.answerPermission(p.id, p.response); return null },
+    'webview.trustedOrigin': (p) => ctx.factory.setTrustedOrigin(p.webviewId, p.origin),
     'webview.navigate': (p) => { webview(p).navigate(p.url); return null },
     'webview.reload': (p) => { webview(p).reload(); return null },
     'webview.setAutoResize': (p) => { webview(p).setAutoResize(Boolean(p.autoResize)); return null },

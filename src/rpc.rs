@@ -679,6 +679,7 @@ pub mod browser {
   #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
   pub struct Reservation { pub lease: String, pub partition: String }
   requests! {
+    SetTrustedOrigin { webview_id: u32, origin: String } => (), "webview.trustedOrigin", deferred = true;
     Acquire { webview_id: u32, workspace: String } => Reservation, "browser.acquire", deferred = true;
     Release { webview_id: u32, lease: String } => (), "browser.release", deferred = true;
   }

@@ -51,10 +51,17 @@ export class AuthenticatedHosts {
     binding.retiredOrigin = undefined
     owner.setAuthenticatedOrigin(host.backendOrigin)
     owner.once('closed', () => {
-      binding.retiredOrigin = binding.host?.backendOrigin
+      binding.retiredOrigin = binding.host?.backendOrigin ?? binding.retiredOrigin
       binding.host = undefined
       binding.owner = undefined
     })
+  }
+
+  unbind(owner: Webview): void {
+    const binding = this.sessions.get(owner.contents.session)
+    if (!binding || binding.owner !== owner) return
+    binding.retiredOrigin = binding.host?.backendOrigin
+    binding.host = undefined
   }
 
   route(target: Session, request: Request): Promise<Response> | undefined {

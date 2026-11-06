@@ -47,6 +47,10 @@ export class BrowserGuests {
     return { lease, partition }
   }
 
+  async releaseAll(owner: Webview): Promise<void> {
+    await Promise.all([...this.leases].filter(([, lease]) => lease.owner === owner).map(([id]) => this.close(id)))
+  }
+
   async release(owner: Webview, id: unknown): Promise<void> {
     this.owner(owner)
     if (typeof id !== 'string') throw new Error('browser guest: invalid lease')
