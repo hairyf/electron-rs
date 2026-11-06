@@ -66,7 +66,7 @@ export class AuthenticatedHosts {
   unbind(owner: Webview): void {
     const binding = this.sessions.get(owner.contents.session)
     if (!binding || binding.owner !== owner) return
-    binding.retiredOrigin = binding.host?.backendOrigin
+    binding.retiredOrigin = binding.host?.backendOrigin ?? binding.retiredOrigin
     binding.host = undefined
   }
 

@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import { BrowserGuests } from './browser'
+import { documentOrigin } from './origin'
 import os from 'node:os'
 import path from 'node:path'
 import { app, BaseWindow, nativeImage, session, WebContentsView } from 'electron'
@@ -52,12 +53,14 @@ export class Factory implements WindowFactory {
 
   async setTrustedOrigin(webviewId: number, value: unknown): Promise<void> {
     if (typeof value !== 'string') throw new Error('invalid trusted document origin')
-    const origin = new URL(value)
-    if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) throw new Error('invalid trusted document origin')
     const owner = this.deps.webviews.get(webviewId)
+    const origin = new URL(value)
+    const normalized = documentOrigin(value)
+    const initial = normalized !== 'null' && normalized === documentOrigin(owner.initialUrl)
+    if ((!['http:', 'https:'].includes(origin.protocol) && !initial) || origin.username || origin.password || !['', '/'].includes(origin.pathname) || origin.search || origin.hash) throw new Error('invalid trusted document origin')
     this.deps.protocols.authenticatedHosts.unbind(owner)
     await this.browser.releaseAll(owner)
-    owner.setAuthenticatedOrigin(origin.origin)
+    owner.setAuthenticatedOrigin(normalized)
   }
 
   createWindow(params: Params): { windowId: number } {
