@@ -5,6 +5,7 @@ import { once } from 'node:events'
 
 const require = createRequire(import.meta.url)
 const { app } = require('electron')
+import { createHash } from 'node:crypto'
 const home = process.env.AUTHENTICATED_HOST_HOME
 assert.ok(home, 'native fixture requires an isolated userData directory')
 app.setPath('userData', home)
@@ -19,6 +20,13 @@ const server = createServer((request, response) => {
     request.once('close', () => { response.end(); streamClosed.resolve() })
   } else response.end('<!doctype html><body>authenticated host</body>')
 })
+const sockets = []
+server.on('upgrade', (request, socket) => {
+  sockets.push(socket)
+  received.push({ url: request.url, cookie: request.headers.cookie, origin: request.headers.origin })
+  const accept = createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n')
+})
 const deadline = setTimeout(() => { console.error('native authenticated host timeout'); app.exit(1) }, 15000)
 async function run() {
 try {
@@ -26,6 +34,9 @@ try {
   console.error("native: ready")
   server.listen(0, '127.0.0.1'); await once(server, 'listening')
   const origin = 'http://127.0.0.1:' + server.address().port
+  const bootstrap = createServer((_request, response) => response.end('<!doctype html><body>bootstrap</body>'))
+  bootstrap.listen(0, '127.0.0.1'); await once(bootstrap, 'listening')
+  const bootstrapUrl = 'http://127.0.0.1:' + bootstrap.address().port
   const { Factory } = require('../../assets/runtime/factory.cjs')
   const { Protocols } = require('../../assets/runtime/protocol.cjs')
   const { Webviews } = require('../../assets/runtime/webview.cjs')
@@ -38,7 +49,7 @@ try {
   const protocols = new Protocols({ policies, transport })
   const factory = new Factory({ windows, webviews, policies, protocols, transport, environment: new Environment(webviews), popups: new Map() })
   const commands = createCommands({ webviews, protocols, factory })
-  factory.createWindow({ windowId: 1, window: { visible: false }, webview: { webviewId: 2, url: 'about:blank', authenticatedWebHostSession: true } })
+  factory.createWindow({ windowId: 1, window: { visible: false }, webview: { webviewId: 2, url: bootstrapUrl, browserHost: true, authenticatedWebHostSession: true } })
   const owner = webviews.get(2)
   await once(owner.contents, 'did-finish-load')
   console.error('native: bootstrap')
@@ -55,6 +66,17 @@ try {
   await owner.contents.executeJavaScript('abort.abort();true')
   await streamClosed.promise
   console.error("native: cancelled")
+  await owner.contents.executeJavaScript('new Promise((resolve,reject)=>{window.socket=new WebSocket(' + JSON.stringify(origin.replace('http:', 'ws:') + '/socket') + ');socket.onopen=()=>resolve(true);socket.onerror=()=>reject(Error("WebSocket failed"))})')
+  assert.equal(received.at(-1).cookie, 'auth=private')
+  assert.equal(received.at(-1).origin, origin)
+  const reservation = factory.acquireBrowserGuest(2, 'workspace')
+  const attached = once(owner.contents, 'did-attach-webview')
+  await owner.contents.executeJavaScript('new Promise((resolve,reject)=>{const guest=document.createElement("webview");guest.partition=' + JSON.stringify(reservation.partition) + ';guest.src=' + JSON.stringify('about:blank#' + reservation.lease) + ';guest.addEventListener("dom-ready",resolve,{once:true});guest.addEventListener("did-fail-load",()=>reject(Error("browser guest failed")),{once:true});document.body.append(guest)})')
+  const [, guest] = await attached
+  assert.notEqual(guest.session, owner.contents.session)
+  assert.equal(await guest.executeJavaScript('typeof window.ipc'), 'undefined')
+  await assert.rejects(guest.loadURL(origin), /ERR_/)
+  await factory.releaseBrowserGuest(2, reservation.lease)
   factory.createWebview({ windowId: 1, webviewId: 3, url: 'about:blank' })
   const other = webviews.get(3)
   assert.notEqual(other.contents.session, owner.contents.session)
@@ -64,8 +86,10 @@ try {
   windows.get(1).destroy()
   console.error('native authenticated-host: PASS')
   clearTimeout(deadline)
+  for (const socket of sockets) socket.destroy()
   server.closeAllConnections()
   await new Promise(resolve => server.close(resolve))
+  await new Promise(resolve => bootstrap.close(resolve))
   app.quit()
 } catch (error) {
   console.error(error); app.exit(1)
