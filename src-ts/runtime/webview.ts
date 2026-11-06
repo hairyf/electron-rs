@@ -37,6 +37,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
   private openingDevtools?: Promise<void>
   private evaluationReady?: Promise<void>
   private documentReady = false
+  private retainedDocumentReady = false
   private generation = 0
   get documentGeneration(): number { return this.generation }
   private contextMenu?: Menu
@@ -105,11 +106,12 @@ export class Webview extends EventEmitter<WebviewEvents> {
     const c = this.contents
     c.on('context-menu', this.onContextMenu)
     c.on('before-input-event', this.onBeforeInput)
-    c.on('did-navigate', (_e, url) => this.emit('navigationCommitted', url))
+    c.on('did-navigate', (_e, url) => { this.retainedDocumentReady = false; this.emit('navigationCommitted', url) })
     c.on('did-navigate-in-page', (_e, url, isMain) => { if (isMain) this.emit('navigationCommitted', url) })
-    c.on('dom-ready', () => { this.documentReady = true; if (this.attached) this.syncOwnerState() })
+    c.on('dom-ready', () => { this.retainedDocumentReady = false; this.documentReady = true; if (this.attached) this.syncOwnerState() })
+    c.on('did-stop-loading', () => { if (this.retainedDocumentReady) { this.documentReady = true; this.retainedDocumentReady = false } })
     c.on('did-start-navigation', (_event, url, inPlace, mainFrame) => {
-      if (mainFrame && !inPlace) { this.documentReady = false; this.generation++; this.emit('loadStarted', url) }
+      if (mainFrame && !inPlace) { this.retainedDocumentReady ||= this.documentReady; this.documentReady = false; this.generation++; this.emit('loadStarted', url) }
     })
     c.on('did-finish-load', () => this.emit('loadFinished', c.getURL()))
     c.on('did-fail-load', (_event, code, _description, url, mainFrame) => { if (mainFrame && code !== -3) this.emit('loadFailed', url) })
@@ -190,15 +192,18 @@ export class Webview extends EventEmitter<WebviewEvents> {
       this.evaluationReady ??= new Promise<void>((resolve, reject) => {
         const finish = (error?: Error) => {
           contents.removeListener('dom-ready', loaded)
+          contents.removeListener('did-stop-loading', stopped)
           contents.removeListener('destroyed', destroyed)
           contents.removeListener('did-start-navigation', navigated)
           if (error) reject(error)
           else resolve()
         }
         const loaded = () => finish()
+        const stopped = () => { if (this.documentReady) finish() }
         const navigated = (_event: unknown, _url: string, inPlace: boolean, mainFrame: boolean) => { if (mainFrame && !inPlace) finish(new Error('webview document replaced before script evaluation')) }
         const destroyed = () => finish(new Error('webview destroyed before script evaluation'))
         contents.once('dom-ready', loaded)
+        contents.on('did-stop-loading', stopped)
         contents.once('destroyed', destroyed)
         contents.on('did-start-navigation', navigated)
       }).finally(() => { this.evaluationReady = undefined })

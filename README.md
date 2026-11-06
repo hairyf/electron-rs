@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ## JavaScript and processes
 
-Webview script evaluation waits for the current main document’s `dom-ready`, not for unrelated images or frames to finish loading. A cross-document navigation rejects pending evaluations from the previous document; same-document navigation preserves them. Concurrent evaluations share one readiness listener, and closing the webview rejects any waiters.
+Webview script evaluation waits for the current main document’s `dom-ready`, not for unrelated images or frames to finish loading. A cross-document navigation rejects pending evaluations from the previous document; same-document navigation preserves them. A denied navigation that retains the previous document restores its readiness when the attempt stops. Concurrent evaluations share readiness listeners, and closing the webview rejects any waiters.
 
 | API | Execution context | Input | Output |
 | --- | --- | --- | --- |

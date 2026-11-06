@@ -73,6 +73,19 @@ try {
   console.error("native: document")
   assert.equal(received.at(-1).cookie, 'auth=private')
   assert.equal((await owner.contents.session.cookies.get({ url: origin })).length, 0)
+  let vetoEvaluation
+  owner.contents.session.webRequest.onBeforeRequest((details, callback) => {
+    if (details.url !== origin + '/denied') { callback({}); return }
+    vetoEvaluation = owner.evaluate('40+2')
+    owner.contents.stop(); callback({ cancel: true })
+  })
+  const vetoTimeout = setTimeout(() => { console.error('retained document evaluation blocked after navigation veto'); app.exit(1) }, 1000)
+  try {
+    await assert.rejects(owner.contents.loadURL(origin + '/denied'), /ERR_FAILED|ERR_ABORTED/)
+    assert.equal(owner.contents.getURL(), host.documentUrl)
+    assert.equal(await vetoEvaluation, 42)
+    assert.equal(await owner.evaluate('41+1'), 42)
+  } finally { clearTimeout(vetoTimeout) }
   const committed = once(owner.contents, 'dom-ready')
   const pendingDocument = owner.contents.loadURL(origin + '/pending-document')
   const finishImage = await pendingImage.promise
