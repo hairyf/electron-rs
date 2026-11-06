@@ -310,6 +310,13 @@ const settle = async () => {
   while (tasks.length) await tasks.shift()()
   await new Promise(setImmediate)
 }
+const drainTimers = (rounds = 64) => {
+  for (let round = 0; round < rounds && timers.size; round++) {
+    const pending = [...timers]
+    timers.clear()
+    for (const timer of pending) timer.callback()
+  }
+}
 const mainViewOf = (window) => inspect('state.mainViews').get(window)?.view
 const mainContentsOf = (window) => context.mainContents(window)
 const cursorStyles = (contents) => [...(contents?.styles.values() ?? [])]
@@ -1566,6 +1573,28 @@ switch (process.argv[2]) {
       transitionListeners: ['enter-full-screen', 'leave-full-screen'].map((event) => host.listeners(event).filter((listener) => !initialFullscreenListeners.get(event).has(listener)).length) }
     break
   }
+  case 'settle-bounds': {
+    await call('window.create', { windowId: 1, width: 900, height: 600 })
+    const host = inspect('state.windows.get(1)')
+    const geometryEvents = ['resize', 'maximize', 'unmaximize', 'restore', 'enter-full-screen', 'leave-full-screen']
+    const baseListeners = geometryEvents.map((event) => host.listenerCount(event))
+    await call('webview.create', { windowId: 1, webviewId: 10, url: 'tauri://localhost/content', autoResize: true })
+    const child = host.children[0]
+    const listeners = geometryEvents.map((event, index) => host.listenerCount(event) - baseListeners[index])
+    const initial = child.getBounds()
+    host.emit('resize')
+    const atMaximizeEvent = child.getBounds()
+    host.content = { x: 0, y: 0, width: 1920, height: 1040 }
+    drainTimers()
+    const maximized = child.getBounds()
+    host.emit('resize')
+    const atRestoreEvent = child.getBounds()
+    host.content = { x: 120, y: 80, width: 1200, height: 800 }
+    drainTimers()
+    const restored = child.getBounds()
+    result = { initial, atMaximizeEvent, maximized, atRestoreEvent, restored, listeners, timers: timers.size }
+    break
+  }
   case 'restore': {
     const main = await createHost(true)
     const initialRestoreListeners = main.listenerCount('restore')
@@ -1585,6 +1614,7 @@ switch (process.argv[2]) {
     await call('window.hide', { windowId: 2 })
     const hidden = (await call('window.geometry', { windowId: 2 })).visible
     await call('window.show', { windowId: 2 })
+    drainTimers()
     result = { beforeEvent, restored, restoreListeners: main.listenerCount('restore') - initialRestoreListeners,
       hidden, shown: (await call('window.geometry', { windowId: 2 })).visible, timers: timers.size }
     break

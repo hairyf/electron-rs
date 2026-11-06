@@ -195,6 +195,32 @@ fn stale_child_bounds_after_parent_resize_scale_instead_of_pinning_old_geometry(
 }
 
 #[test]
+fn stale_linux_resize_events_settle_to_the_latest_parent_bounds() {
+    let observed: Value = serde_json::from_str(&support::node(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
+        &["settle-bounds"],
+    ))
+    .unwrap();
+
+    assert_eq!(
+        observed["initial"],
+        json!({ "x": 0, "y": 0, "width": 900, "height": 600 })
+    );
+    assert_eq!(observed["atMaximizeEvent"], observed["initial"]);
+    assert_eq!(
+        observed["maximized"],
+        json!({ "x": 0, "y": 0, "width": 1920, "height": 1040 })
+    );
+    assert_eq!(observed["atRestoreEvent"], observed["maximized"]);
+    assert_eq!(
+        observed["restored"],
+        json!({ "x": 0, "y": 0, "width": 1200, "height": 800 })
+    );
+    assert_eq!(observed["listeners"], json!([1, 1, 1, 1, 1, 1]));
+    assert_eq!(observed["timers"], 0);
+}
+
+#[test]
 fn child_dispatch_and_close_never_target_the_unloaded_host() {
     let observed: Value = serde_json::from_str(&support::node(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/webview-layout.mjs"),
