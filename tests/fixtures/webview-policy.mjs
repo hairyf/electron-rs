@@ -416,6 +416,7 @@ async function managedGuest() {
   const page = runtime.webviews.get(41)
   assert.equal(page.id, 41)
   contents.url = url
+  contents.emit('dom-ready')
   contents.mainFrame = { url, origin: new URL(url).origin, executeJavaScript: script => contents.executeJavaScript(script) }
   assert.equal(page.contents, contents)
   contents.executeJavaScript = async script => ({ contentsId: contents.id, script })

@@ -14,10 +14,15 @@ app.setPath('userData', home)
 const received = []
 let streamClosed = Promise.withResolvers()
 let slowRequest = Promise.withResolvers()
+const pendingImage = Promise.withResolvers()
 const server = createServer((request, response) => {
   received.push({ url: request.url, cookie: request.headers.cookie, origin: request.headers.origin })
   if (request.url === '/?token=owned') {
     response.writeHead(303, { 'set-cookie': 'auth=private; HttpOnly', location: '/' }); response.end()
+  } else if (request.url === '/pending-document') {
+    response.writeHead(200, { 'content-type': 'text/html' }); response.end('<!doctype html><body>document ready<img src="/pending-image"></body>')
+  } else if (request.url === '/pending-image') {
+    pendingImage.resolve(() => response.end())
   } else if (request.url === '/slow') {
     slowRequest.resolve(() => response.end('<!doctype html><body>slow document</body>'))
   } else if (request.url === '/stream') {
@@ -68,6 +73,19 @@ try {
   console.error("native: document")
   assert.equal(received.at(-1).cookie, 'auth=private')
   assert.equal((await owner.contents.session.cookies.get({ url: origin })).length, 0)
+  const committed = once(owner.contents, 'dom-ready')
+  const pendingDocument = owner.contents.loadURL(origin + '/pending-document')
+  const finishImage = await pendingImage.promise
+  await committed
+  assert.equal(await owner.contents.mainFrame.executeJavaScript('document.readyState'), 'interactive')
+  const timeout = setTimeout(() => { console.error('committed document evaluation blocked by pending image'); app.exit(1) }, 1000)
+  try {
+    assert.deepEqual(await Promise.all(Array.from({ length: 12 }, (_, index) => owner.evaluate(String(index)))), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+  } finally {
+    clearTimeout(timeout)
+    finishImage()
+  }
+  await pendingDocument
   const chunk = await owner.contents.executeJavaScript('(async()=>{window.abort=new AbortController();const response=await fetch("/stream",{signal:abort.signal});window.reader=response.body.getReader();return new TextDecoder().decode((await reader.read()).value)})()')
   console.error('native: chunk', chunk)
   assert.equal(chunk, 'first')
@@ -124,14 +142,14 @@ try {
   slowRequest = Promise.withResolvers()
   const navigation = other.contents.loadURL(origin + '/slow')
   const finish = await slowRequest.promise
-  const baseline = other.contents.listenerCount('did-stop-loading')
+  const baseline = other.contents.listenerCount('dom-ready')
   const evaluations = Array.from({ length: 12 }, (_, index) => other.evaluate(String(index)))
   await new Promise(resolve => setImmediate(resolve))
-  assert.equal(other.contents.listenerCount('did-stop-loading'), baseline + 1)
+  assert.equal(other.contents.listenerCount('dom-ready'), baseline + 1)
   finish()
   await navigation
   assert.deepEqual(await Promise.all(evaluations), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
-  assert.equal(other.contents.listenerCount('did-stop-loading'), 0)
+  assert.equal(other.contents.listenerCount('dom-ready'), baseline)
   slowRequest = Promise.withResolvers()
   const closingNavigation = other.contents.loadURL(origin + '/slow').catch(error => error)
   await slowRequest.promise

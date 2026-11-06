@@ -36,6 +36,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
   private nativePopup = false
   private openingDevtools?: Promise<void>
   private evaluationReady?: Promise<void>
+  private documentReady = false
   private generation = 0
   get documentGeneration(): number { return this.generation }
   private contextMenu?: Menu
@@ -80,6 +81,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
     if (!view && !guest) throw new Error('webview requires a view or an adopted guest')
     this.adopted = guest !== undefined
     this.nativeContents = guest ?? view!.webContents
+    this.documentReady = Boolean(this.nativeContents.getURL()) && !this.nativeContents.isLoadingMainFrame()
     this.contentsId = this.nativeContents.id; this.autoResize = Boolean(config.autoResize); this.policy = config.policy
     this.attached = this.adopted
     this.bindEvents()
@@ -105,9 +107,9 @@ export class Webview extends EventEmitter<WebviewEvents> {
     c.on('before-input-event', this.onBeforeInput)
     c.on('did-navigate', (_e, url) => this.emit('navigationCommitted', url))
     c.on('did-navigate-in-page', (_e, url, isMain) => { if (isMain) this.emit('navigationCommitted', url) })
-    c.on('dom-ready', () => { if (this.attached) this.syncOwnerState() })
+    c.on('dom-ready', () => { this.documentReady = true; if (this.attached) this.syncOwnerState() })
     c.on('did-start-navigation', (_event, url, inPlace, mainFrame) => {
-      if (mainFrame && !inPlace) { this.generation++; this.emit('loadStarted', url) }
+      if (mainFrame && !inPlace) { this.documentReady = false; this.generation++; this.emit('loadStarted', url) }
     })
     c.on('did-finish-load', () => this.emit('loadFinished', c.getURL()))
     c.on('did-fail-load', (_event, code, _description, url, mainFrame) => { if (mainFrame && code !== -3) this.emit('loadFailed', url) })
@@ -184,10 +186,10 @@ export class Webview extends EventEmitter<WebviewEvents> {
     const contents = this.contents
     if (documentGeneration !== this.generation) throw new Error('webview document replaced before script evaluation')
     if (contents.isDestroyed()) throw new Error('webview destroyed before script evaluation')
-    if (!contents.getURL() || contents.isLoadingMainFrame()) {
+    if (!this.documentReady) {
       this.evaluationReady ??= new Promise<void>((resolve, reject) => {
         const finish = (error?: Error) => {
-          contents.removeListener('did-stop-loading', loaded)
+          contents.removeListener('dom-ready', loaded)
           contents.removeListener('destroyed', destroyed)
           contents.removeListener('did-start-navigation', navigated)
           if (error) reject(error)
@@ -196,7 +198,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
         const loaded = () => finish()
         const navigated = (_event: unknown, _url: string, inPlace: boolean, mainFrame: boolean) => { if (mainFrame && !inPlace) finish(new Error('webview document replaced before script evaluation')) }
         const destroyed = () => finish(new Error('webview destroyed before script evaluation'))
-        contents.once('did-stop-loading', loaded)
+        contents.once('dom-ready', loaded)
         contents.once('destroyed', destroyed)
         contents.on('did-start-navigation', navigated)
       }).finally(() => { this.evaluationReady = undefined })

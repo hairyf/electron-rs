@@ -88,6 +88,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ## JavaScript and processes
 
+Webview script evaluation waits for the current main document’s `dom-ready`, not for unrelated images or frames to finish loading. A cross-document navigation rejects pending evaluations from the previous document; same-document navigation preserves them. Concurrent evaluations share one readiness listener, and closing the webview rejects any waiters.
+
 | API | Execution context | Input | Output |
 | --- | --- | --- | --- |
 | `client.node(args)` | Separate process, client's binary, `ELECTRON_RUN_AS_NODE=1` | Node CLI args | `io::Result<tokio::process::Child>` |
