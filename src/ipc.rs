@@ -82,7 +82,6 @@ pub struct Electron {
   binary: PathBuf,
   writer: Arc<Mutex<TcpStream>>,
   writer_order: Arc<tokio::sync::Mutex<()>>,
-  write_activity: Arc<Mutex<Option<(String, Instant, usize, &'static str)>>>,
   shutdown_stream: TcpStream,
   pending: Mutex<HashMap<u64, PendingSender>>,
   command_routes: Mutex<HashMap<String, CommandRoute>>,
@@ -277,7 +276,6 @@ impl Electron {
       binary,
       writer: Arc::new(Mutex::new(writer)),
       writer_order: Arc::new(tokio::sync::Mutex::new(())),
-      write_activity: Arc::new(Mutex::new(None)),
       shutdown_stream,
       pending: Mutex::new(HashMap::new()),
       command_routes: Mutex::new(HashMap::new()),
@@ -385,7 +383,7 @@ impl Electron {
     if write_timeout.is_zero() { return Err(Error::IpcTimeout { timeout_duration: write_timeout }); }
     let deadline = started.checked_add(write_timeout).ok_or(Error::IpcTimeout { timeout_duration: write_timeout })?;
     if notification {
-      self.write_line(method, line, deadline).await?;
+      self.write_line(line, deadline).await?;
       return Ok(Value::Null);
     }
     let (sender, receiver) = oneshot::channel();
@@ -395,7 +393,7 @@ impl Electron {
       pending.insert(id, (method.to_owned(), command_task, sender));
     }
     let guard = PendingGuard { electron: self, id };
-    if let Err(error) = self.write_line(method, line, deadline).await {
+    if let Err(error) = self.write_line(line, deadline).await {
       drop(guard);
       self.shutdown();
       return Err(error);
@@ -409,40 +407,20 @@ impl Electron {
     result.unwrap_or(Err(Error::ChannelDisconnected))
   }
 
-  async fn write_line(&self, method: &str, line: Vec<u8>, deadline: Instant) -> Result<(), Error> {
+  async fn write_line(&self, line: Vec<u8>, deadline: Instant) -> Result<(), Error> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let order = tokio::time::timeout(timeout, Arc::clone(&self.writer_order).lock_owned()).await
-      .map_err(|_| {
-        let activity = self.write_activity.lock().unwrap();
-        eprintln!("[DEBUG-pr1427] transport method={method} stage=writer_order timeout={timeout:?} active={:?} pending={}", activity.as_ref().map(|(method, since, bytes, stage)| (method, since.elapsed(), bytes, stage)), self.pending.lock().unwrap().len());
-        Error::IpcTimeout { timeout_duration: timeout }
-      })?;
+      .map_err(|_| Error::IpcTimeout { timeout_duration: timeout })?;
     let timeout = deadline.saturating_duration_since(Instant::now());
-    if timeout.is_zero() {
-      eprintln!("[DEBUG-pr1427] transport method={method} stage=write_budget timeout={timeout:?}");
-      return Err(Error::IpcTimeout { timeout_duration: timeout });
-    }
+    if timeout.is_zero() { return Err(Error::IpcTimeout { timeout_duration: timeout }); }
     let writer = Arc::clone(&self.writer);
-    let activity = Arc::clone(&self.write_activity);
-    let acquired = Instant::now();
-    *activity.lock().unwrap() = Some((method.into(), acquired, line.len(), "blocking_queue"));
     let task = tokio::task::spawn_blocking(move || {
       let _order = order;
-      activity.lock().unwrap().as_mut().unwrap().3 = "socket_write";
-      let result = writer.lock().map_err(|_| Error::from("writer lock poisoned"))
-        .and_then(|mut writer| writer.set_write_timeout(Some(timeout)).and_then(|()| writer.write_all(&line)).map_err(Error::from));
-      if acquired.elapsed() > Duration::from_millis(100) {
-        eprintln!("[DEBUG-pr1427] slow write active={:?}", activity.lock().unwrap().as_ref().map(|(method, since, bytes, stage)| (method, since.elapsed(), bytes, stage)));
-      }
-      *activity.lock().unwrap() = None;
-      result
+      writer.lock().map_err(|_| Error::from("writer lock poisoned"))
+        .and_then(|mut writer| writer.set_write_timeout(Some(timeout)).and_then(|()| writer.write_all(&line)).map_err(Error::from))
     });
-    tokio::time::timeout(timeout, task).await.map_err(|_| {
-      eprintln!("[DEBUG-pr1427] transport method={method} stage=write timeout={timeout:?}");
-      Error::IpcTimeout { timeout_duration: timeout }
-    })?
+    tokio::time::timeout(timeout, task).await.map_err(|_| Error::IpcTimeout { timeout_duration: timeout })?
       .map_err(|error| Error::with_source("Electron RPC writer failed", error))?
-      .inspect_err(|error| eprintln!("[DEBUG-pr1427] transport method={method} stage=socket_write error={error}"))
   }
 
   /// Build a command that runs this client's binary in Node mode, without RPC.
@@ -959,7 +937,6 @@ mod tests {
       binary: PathBuf::new(),
       writer: Arc::new(Mutex::new(reader.get_ref().try_clone().unwrap())),
       writer_order: Arc::new(tokio::sync::Mutex::new(())),
-      write_activity: Arc::new(Mutex::new(None)),
       shutdown_stream: reader.get_ref().try_clone().unwrap(),
       pending: Mutex::new(HashMap::new()),
       command_routes: Mutex::new(HashMap::new()),
