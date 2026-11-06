@@ -695,6 +695,7 @@ pub mod protocol {
 
   requests! {
     AuthenticateHost { url: String } => AuthenticatedHost, "webHost.authenticate", deferred = true;
+    HostCookieHeader { host_id: String } => String, "webHost.cookieHeader", deferred = true;
     BindHost { webview_id: u32, host_id: String } => (), "webHost.bind";
     Register { scheme: String } => (), "protocol.register";
     Respond {

@@ -52,6 +52,8 @@ try {
   assert.equal(host.documentUrl, origin + '/')
   assert.equal(host.backendOrigin, origin)
   assert.equal(JSON.stringify(host).includes('private'), false)
+  assert.equal(hosts.cookieHeader(host.id), 'auth=private')
+  assert.throws(() => hosts.cookieHeader('unregistered'), /unknown authenticated host/)
   const target = hosts.createSession()
   protocols.prepare(target)
   const owner = Object.assign(new EventEmitter(), {

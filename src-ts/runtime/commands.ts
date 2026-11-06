@@ -177,6 +177,7 @@ function webviewCommands(ctx: CommandContext): CommandTable {
 function protocolCommands(ctx: CommandContext): CommandTable {
   return {
     'webHost.authenticate': (p) => ctx.protocols.authenticatedHosts.authenticate(p.url),
+    'webHost.cookieHeader': (p) => ctx.protocols.authenticatedHosts.cookieHeader(p.hostId),
     'webHost.bind': (p) => { ctx.protocols.authenticatedHosts.bind(ctx.webviews.get(p.webviewId), p.hostId); return null },
     'protocol.register': (p) => { ctx.protocols.register(p.scheme); return null },
     'protocol.respond': (p) => { ctx.protocols.answer(p.id, p); return null },

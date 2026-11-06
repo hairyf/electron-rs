@@ -26,6 +26,12 @@ export class AuthenticatedHosts {
     return { id, documentUrl: host.documentUrl, backendOrigin: host.backendOrigin }
   }
 
+  cookieHeader(id: unknown): string {
+    const host = typeof id === 'string' ? this.hosts.get(id) : undefined
+    if (!host) throw new Error('unknown authenticated host')
+    return host.cookie
+  }
+
   ownsSession(target: Session): boolean { return this.sessions.has(target) }
 
   createSession(): Session {
