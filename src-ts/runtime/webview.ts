@@ -20,6 +20,7 @@ type NativeContents = WebContents & { navigationHistory?: { canGoBack(): boolean
 
 export class Webview extends EventEmitter<WebviewEvents> {
   private main = false
+  private authenticatedOrigin?: string
   private autoResize: boolean
   private policy?: WebviewPolicy
   private reference?: { bounds: Rectangle; parent: Rectangle }
@@ -75,9 +76,12 @@ export class Webview extends EventEmitter<WebviewEvents> {
   setMain(main: boolean): void { this.main = main }
   get webviewPolicy(): WebviewPolicy | undefined { return this.policy }
   get initialUrl(): string { return this.config.url }
+  get authenticatedWebHost(): unknown { return this.config.authenticatedWebHost }
   get browserHost(): boolean { return this.config.browserHost === true }
+  get trustedOrigin(): string { return this.authenticatedOrigin ?? new URL(this.initialUrl).origin }
+  setAuthenticatedOrigin(origin: string): void { this.authenticatedOrigin = origin }
   acceptsIpc(url: string): boolean {
-    const origin = this.browserHost ? new URL(this.initialUrl).origin : this.config.ipcOrigin
+    const origin = this.authenticatedOrigin ?? (this.browserHost ? this.trustedOrigin : this.config.ipcOrigin)
     if (typeof origin !== 'string') return true
     try { return new URL(url).origin !== 'null' && new URL(url).origin === origin } catch { return false }
   }

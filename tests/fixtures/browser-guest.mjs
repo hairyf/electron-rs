@@ -42,7 +42,7 @@ async function run() {
       const hostUrl = await serve('<!doctype html><style>html{background:rgb(17,85,153)}</style><body>host<script>window.captureNonce=crypto.randomUUID();window.captureLoads=Number(sessionStorage.captureLoads||0)+1;sessionStorage.captureLoads=window.captureLoads</script></body>')
       const externalUrl = await serve('<!doctype html><title>external browser</title><body>external</body>')
       const factory = new Factory({ windows, webviews, environment: new Environment(webviews),
-        policies: { attach() {} }, protocols: { prepare() {} }, popups: new Map(),
+        policies: { attach() {} }, protocols: { prepare() {}, authenticatedHosts: { ownsSession() { return false } } }, popups: new Map(),
         transport: { closed: false, send(event, params) { events.push({ event, params }) } },
       })
       factory.createWindow({ windowId: 1, window: { width: 700, height: 500, visible: false }, webview: { webviewId: 2, url: hostUrl } })

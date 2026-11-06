@@ -1,0 +1,74 @@
+import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
+import { createServer } from 'node:http'
+import { once } from 'node:events'
+
+const require = createRequire(import.meta.url)
+const { app } = require('electron')
+const home = process.env.AUTHENTICATED_HOST_HOME
+assert.ok(home, 'native fixture requires an isolated userData directory')
+app.setPath('userData', home)
+const received = []
+let streamClosed = Promise.withResolvers()
+const server = createServer((request, response) => {
+  received.push({ url: request.url, cookie: request.headers.cookie, origin: request.headers.origin })
+  if (request.url === '/?token=owned') {
+    response.writeHead(303, { 'set-cookie': 'auth=private; HttpOnly', location: '/' }); response.end()
+  } else if (request.url === '/stream') {
+    response.writeHead(200, { 'content-type': 'text/event-stream' }); response.write('first')
+    request.once('close', () => { response.end(); streamClosed.resolve() })
+  } else response.end('<!doctype html><body>authenticated host</body>')
+})
+const deadline = setTimeout(() => { console.error('native authenticated host timeout'); app.exit(1) }, 15000)
+async function run() {
+try {
+  await app.whenReady()
+  console.error("native: ready")
+  server.listen(0, '127.0.0.1'); await once(server, 'listening')
+  const origin = 'http://127.0.0.1:' + server.address().port
+  const { Factory } = require('../../assets/runtime/factory.cjs')
+  const { Protocols } = require('../../assets/runtime/protocol.cjs')
+  const { Webviews } = require('../../assets/runtime/webview.cjs')
+  const { Windows } = require('../../assets/runtime/window.cjs')
+  const { Environment } = require('../../assets/runtime/environment.cjs')
+  const { createCommands } = require('../../assets/runtime/commands.cjs')
+  const webviews = new Webviews(), windows = new Windows()
+  const policies = { install() {}, attach() {} }
+  const transport = { closed: false, send(event) { assert.notEqual(event, 'protocol.request', 'body must never cross Rust') } }
+  const protocols = new Protocols({ policies, transport })
+  const factory = new Factory({ windows, webviews, policies, protocols, transport, environment: new Environment(webviews), popups: new Map() })
+  const commands = createCommands({ webviews, protocols, factory })
+  factory.createWindow({ windowId: 1, window: { visible: false }, webview: { webviewId: 2, url: 'about:blank', authenticatedWebHostSession: true } })
+  const owner = webviews.get(2)
+  await once(owner.contents, 'did-finish-load')
+  console.error('native: bootstrap')
+  const host = await commands['webHost.authenticate']({ url: origin + '/?token=owned' })
+  commands['webHost.bind']({ webviewId: 2, hostId: host.id })
+  console.error("native: authenticated", host.documentUrl)
+  await owner.contents.loadURL(host.documentUrl)
+  console.error("native: document")
+  assert.equal(received.at(-1).cookie, 'auth=private')
+  assert.equal((await owner.contents.session.cookies.get({ url: origin })).length, 0)
+  const chunk = await owner.contents.executeJavaScript('(async()=>{window.abort=new AbortController();const response=await fetch("/stream",{signal:abort.signal});window.reader=response.body.getReader();return new TextDecoder().decode((await reader.read()).value)})()')
+  console.error('native: chunk', chunk)
+  assert.equal(chunk, 'first')
+  await owner.contents.executeJavaScript('abort.abort();true')
+  await streamClosed.promise
+  console.error("native: cancelled")
+  factory.createWebview({ windowId: 1, webviewId: 3, url: 'about:blank' })
+  const other = webviews.get(3)
+  assert.notEqual(other.contents.session, owner.contents.session)
+  await once(other.contents, 'did-finish-load')
+  await other.contents.loadURL(origin)
+  assert.equal(received.at(-1).cookie, undefined)
+  windows.get(1).destroy()
+  console.error('native authenticated-host: PASS')
+  clearTimeout(deadline)
+  server.closeAllConnections()
+  await new Promise(resolve => server.close(resolve))
+  app.quit()
+} catch (error) {
+  console.error(error); app.exit(1)
+}
+}
+void run().catch(error => { console.error(error); app.exit(1) })

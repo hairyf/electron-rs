@@ -14,7 +14,7 @@ export class BrowserGuests {
   constructor(private readonly transport: Transport) {}
 
   private owner(owner: Webview): void {
-    const origin = this.hosts.get(owner)
+    const origin = this.hosts.has(owner) ? owner.trustedOrigin : undefined
     if (!origin || owner.contents.isDestroyed() || new URL(owner.contents.getURL()).origin !== origin) throw new Error('browser guest: untrusted owner')
   }
 
@@ -69,8 +69,8 @@ export class BrowserGuests {
 
   private applicationHost(url: URL): boolean {
     if (['ipc.localhost', 'tauri.localhost'].includes(url.hostname)) return true
-    return [...this.hosts.values()].some(value => {
-      const host = new URL(value)
+    return [...this.hosts.keys()].some(owner => {
+      const host = new URL(owner.trustedOrigin)
       return url.port === host.port && (url.hostname === host.hostname || ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
     })
   }
@@ -83,7 +83,7 @@ export class BrowserGuests {
   }
 
   bind(owner: Webview): void {
-    const origin = new URL(owner.initialUrl).origin
+    const origin = owner.trustedOrigin
     if (origin === 'null') throw new Error('browser guest: host requires a document origin')
     this.hosts.set(owner, origin)
     const contents = owner.contents
@@ -98,7 +98,7 @@ export class BrowserGuests {
     contents.on('will-attach-webview', (event, preferences, params) => {
       const id = typeof params.src === 'string' && params.src.startsWith('about:blank#') ? params.src.slice(12) : ''
       const lease = this.leases.get(id)
-      if (!lease || lease.owner !== owner || lease.frame !== contents.mainFrame || lease.attached || params.partition !== lease.partition || new URL(contents.getURL()).origin !== origin) { event.preventDefault(); return }
+      if (!lease || lease.owner !== owner || lease.frame !== contents.mainFrame || lease.attached || params.partition !== lease.partition || new URL(contents.getURL()).origin !== owner.trustedOrigin) { event.preventDefault(); return }
       const instanceId: unknown = params.instanceId
       if (typeof instanceId !== 'number' || !Number.isSafeInteger(instanceId) || attachments.has(instanceId)) { event.preventDefault(); return }
       attachments.set(instanceId, id)
@@ -126,7 +126,7 @@ export class BrowserGuests {
       })
       guest.setWindowOpenHandler(({ url, postBody }) => {
         const lease = attachedId ? this.leases.get(attachedId) : undefined
-        if (lease?.guest === guest && !contents.isDestroyed() && lease.frame === contents.mainFrame && new URL(contents.getURL()).origin === origin && postBody === undefined && this.navigation(url)) {
+        if (lease?.guest === guest && !contents.isDestroyed() && lease.frame === contents.mainFrame && new URL(contents.getURL()).origin === owner.trustedOrigin && postBody === undefined && this.navigation(url)) {
           this.transport.send('browser.openRequested', { webviewId: owner.id, lease: attachedId, url: new URL(url).href })
         }
         return { action: 'deny' }

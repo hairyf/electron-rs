@@ -3,7 +3,7 @@ import { isThenable } from '../utils'
 import type { CommandTable } from './table'
 
 const synchronousMethods = new Set([
-  'window.create', 'protocol.register', 'protocol.respond', 'webview.url',
+  'window.create', 'protocol.register', 'protocol.respond', 'webview.url', 'webHost.bind',
   'webview.newWindowResponse', 'webview.navigationResponse', 'webview.downloadResponse', 'webview.permissionResponse',
   'window.nativeHandle', 'window.setMenu', 'window.setTitle', 'window.geometry', 'window.icon',
   'window.size', 'window.position', 'window.minSize', 'window.maxSize', 'window.sizeConstraints',

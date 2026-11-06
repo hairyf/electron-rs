@@ -12,6 +12,10 @@ Set the trusted webview creation config’s `browserHost` to `true`, then call `
 
 Run `pnpm run build && pnpm run test:browser` for the isolated real-Electron regression (Linux requires a graphical session/Xvfb and the normal Electron sandbox setup).
 
+## Authenticated web hosts
+
+Create a webview with `authenticatedWebHostSession: true` before loading its local bootstrap document. Call `rpc::protocol::AuthenticateHost { url }` with the owned backend launch URL, then `BindHost { webview_id, host_id }` before navigating to the returned `document_url`. Authentication requires a 303 and Set-Cookie; only an opaque id and token-free URLs leave the Electron main process. Each host webview uses a private, nonpersistent session. Exact backend HTTP requests stream through main-process fetch/Response; HTTP/WS headers are scoped to the bound webContents and backend origin. Unrelated guests never inherit this session.
+
 ## Install
 
 Git-only; pin a revision or tag for release builds.

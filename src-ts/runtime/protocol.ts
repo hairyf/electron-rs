@@ -1,4 +1,5 @@
 import { net, protocol } from 'electron'
+import { AuthenticatedHosts } from './authenticated-host'
 import type { Protocol, Session } from 'electron'
 import type { Transport } from '../socket/transport'
 import type { Policies } from './policy'
@@ -38,6 +39,7 @@ export interface ProtocolHost {
 }
 
 export class Protocols {
+  readonly authenticatedHosts = new AuthenticatedHosts()
   private readonly registered = new Set<string>()
   private readonly prepared = new WeakSet<Session>()
   private readonly localhost = new WeakSet<Protocol>()
@@ -123,6 +125,10 @@ export class Protocols {
     this.localhost.add(target)
     const fetch = (request: Request) => network.fetch(request, { bypassCustomProtocolHandlers: true })
     for (const transport of ['http', 'https'] as const) target.handle(transport, (request) => {
+      if ('protocol' in network) {
+        const authenticated = this.authenticatedHosts.route(network, request)
+        if (authenticated) return authenticated
+      }
       const url = new URL(request.url)
       const match = /^([a-z][a-z0-9+.-]*)\.localhost$/.exec(url.hostname)
       if (url.port || !match || !this.registered.has(match[1])) return fetch(request)

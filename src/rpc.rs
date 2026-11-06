@@ -688,7 +688,13 @@ pub mod browser {
 pub mod protocol {
   use super::*;
 
+  #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+  #[serde(rename_all = "camelCase")]
+  pub struct AuthenticatedHost { pub id: String, pub document_url: String, pub backend_origin: String }
+
   requests! {
+    AuthenticateHost { url: String } => AuthenticatedHost, "webHost.authenticate", deferred = true;
+    BindHost { webview_id: u32, host_id: String } => (), "webHost.bind";
     Register { scheme: String } => (), "protocol.register";
     Respond {
       id: u64,

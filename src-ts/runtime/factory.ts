@@ -123,7 +123,8 @@ export class Factory implements WindowFactory {
       return { webviewId }
     }
     const config = { ...window.configuration, ...Object.fromEntries(Object.entries(params).filter(([, value]) => value != null)) } as WindowConfig
-    const targetSession = this.sessionFor(init) ?? this.deps.webviews.main(window)?.contents.session ?? session.defaultSession
+    const inheritedSession = this.deps.webviews.main(window)?.contents.session
+    const targetSession = this.sessionFor(init) ?? (inheritedSession && !this.deps.protocols.authenticatedHosts.ownsSession(inheritedSession) ? inheritedSession : session.defaultSession)
     const webPreferences = this.webPreferences(init, config, targetSession)
     const view = new WebContentsView({ webPreferences })
     const webview = new Webview(window, webviewId, view, init, webPreferences?.devTools)
@@ -161,7 +162,8 @@ export class Factory implements WindowFactory {
   private sessionFor(params?: Params | null): Session | undefined {
     if (!params) return undefined
     let target: Session | undefined
-    if (params.incognito) target = session.fromPartition(`tauri-private-${++Factory.nextPrivateSession}`)
+    if (params.authenticatedWebHostSession) target = this.deps.protocols.authenticatedHosts.createSession()
+    else if (params.incognito) target = session.fromPartition(`tauri-private-${++Factory.nextPrivateSession}`)
     else if (params.dataDirectory) target = session.fromPath(path.resolve(params.dataDirectory))
     if (target && !this.customSessions.has(target)) {
       this.customSessions.add(target)
@@ -252,6 +254,7 @@ export class Factory implements WindowFactory {
 
   private wireWebview(webview: Webview): void {
     const { id } = webview
+    if (webview.authenticatedWebHost) this.deps.protocols.authenticatedHosts.bind(webview, webview.authenticatedWebHost)
     webview.on('navigationCommitted', (url) => this.deps.transport.send('webview.navigationCommitted', { webviewId: id, url }))
     webview.on('loadStarted', (url) => this.deps.transport.send('webview.loadStarted', { webviewId: id, url }))
     webview.on('loadFinished', (url) => this.deps.transport.send('webview.loadFinished', { webviewId: id, url }))
@@ -276,6 +279,8 @@ export class Factory implements WindowFactory {
       const initial = new URL(webview.initialUrl)
       if (!current.host || current.protocol !== initial.protocol || current.host !== initial.host) { event.preventDefault(); return }
       preferences.preload = plan.preload
+      const targetSession = this.sessionFor(plan.init)
+      if (targetSession) preferences.session = targetSession
       preferences.webviewTag = plan.init.browserHost === true
       preferences.nodeIntegrationInSubFrames = false
       const instanceId = params?.instanceId
@@ -303,6 +308,7 @@ export class Factory implements WindowFactory {
   }
 
   private guestPreferences(host: Webview, preferences: WebPreferences): void {
+    if (this.deps.protocols.authenticatedHosts.ownsSession(host.contents.session)) preferences.session = session.defaultSession
     preferences.preload = path.join(__dirname, '..', 'preload.cjs')
     preferences.contextIsolation = true
     preferences.sandbox = true
