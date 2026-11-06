@@ -98,7 +98,7 @@ class Contents extends EventEmitter {
   isDestroyed() { return this.destroyed }
   stop() { this.stops++ }
   setWindowOpenHandler(callback) { this.openWindow = callback }
-  loadURL(url) { this.url = url; this.loads.push(url); return Promise.resolve() }
+  loadURL(url) { this.url = url; this.loads.push(url); this.emit('dom-ready'); return Promise.resolve() }
   getURL() { return this.url ?? '' }
   isLoadingMainFrame() { return false }
   close() { this.destroyed = true; this.emit('destroyed') }

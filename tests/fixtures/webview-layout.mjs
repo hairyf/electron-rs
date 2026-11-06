@@ -77,7 +77,7 @@ class Contents extends EventEmitter {
     if (faults.applyWebviewConfig) throw new Error('webview config failed')
     this.calls.push({ method: 'setUserAgent', value }); this.userAgent = value
   }
-  loadURL(url) { this.calls.push({ method: 'loadURL', value: url }); this.url = url; return Promise.resolve() }
+  loadURL(url) { this.calls.push({ method: 'loadURL', value: url }); this.url = url; this.emit('dom-ready'); return Promise.resolve() }
   getURL() { return this.url ?? '' }
   isLoadingMainFrame() { return false }
   getLastWebPreferences() { return {} }
