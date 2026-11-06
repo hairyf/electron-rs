@@ -137,7 +137,7 @@ function webviewCommands(ctx: CommandContext): CommandTable {
     'browser.acquire': (p) => ctx.factory.acquireBrowserGuest(p.webviewId, p.workspace),
     'browser.release': (p) => ctx.factory.releaseBrowserGuest(p.webviewId, p.lease),
     'webview.url': (p) => webview(p).contents.getURL(),
-    'webview.eval': (p) => webview(p).evaluate(p.script),
+    'webview.eval': (p) => webview(p).evaluate(p.script, p.documentGeneration),
     'webview.capture': (p) => webview(p).capture(),
     // 策略应答：id 是策略请求自己的编号，不是这条 RPC 的编号。
     'webview.newWindowResponse': (p) => { ctx.respond(p.id, p.response); return null },
@@ -147,6 +147,7 @@ function webviewCommands(ctx: CommandContext): CommandTable {
       return null
     },
     'webview.permissionResponse': (p) => { ctx.policies.answerPermission(p.id, p.response); return null },
+    'webview.trustedOrigin': (p) => ctx.factory.setTrustedOrigin(p.webviewId, p.origin),
     'webview.navigate': (p) => { webview(p).navigate(p.url); return null },
     'webview.reload': (p) => { webview(p).reload(); return null },
     'webview.setAutoResize': (p) => { webview(p).setAutoResize(Boolean(p.autoResize)); return null },
@@ -175,6 +176,9 @@ function webviewCommands(ctx: CommandContext): CommandTable {
 
 function protocolCommands(ctx: CommandContext): CommandTable {
   return {
+    'webHost.authenticate': (p) => ctx.protocols.authenticatedHosts.authenticate(p.url),
+    'webHost.cookieHeader': (p) => ctx.protocols.authenticatedHosts.cookieHeader(p.hostId),
+    'webHost.bind': (p) => { ctx.protocols.authenticatedHosts.bind(ctx.webviews.get(p.webviewId), p.hostId); return null },
     'protocol.register': (p) => { ctx.protocols.register(p.scheme); return null },
     'protocol.respond': (p) => { ctx.protocols.answer(p.id, p); return null },
   }

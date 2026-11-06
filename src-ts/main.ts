@@ -147,7 +147,7 @@ ipcMain.handle('tauri-ipc-fetch', async (event, data) => {
   if (url.username || url.password || url.port || !((url.protocol === 'ipc:' && url.hostname === 'localhost') || (/^https?:$/.test(url.protocol) && url.hostname === 'ipc.localhost'))) throw new Error('invalid IPC request')
   const headers = new Headers(data.headers)
   headers.set('Origin', frame.origin)
-  const response = await protocols.fetchIpc(new Request(url, { method: 'POST', headers, body: data.body }), webview.id)
+  const response = await protocols.fetchIpc(new Request(url, { method: 'POST', headers, body: data.body }), webview.id, webview.documentGeneration)
   return { status: response.status, headers: [...response.headers], body: new Uint8Array(await response.arrayBuffer()) }
 })
 
@@ -156,7 +156,7 @@ ipcMain.on('tauri-ipc', (event, data) => {
   if (!frame || frame !== event.sender.mainFrame || frame.origin === 'null' || typeof data !== 'string') return
   const webview = webviews.forContents(event.sender.id)
   if (!webview || !webview.acceptsIpc(frame.url)) return
-  transport.send('ipc.message', { webviewId: webview.id, url: frame.url, body: data })
+  transport.send('ipc.message', { webviewId: webview.id, documentGeneration: webview.documentGeneration, url: frame.url, body: data })
 })
 
 // 下载终态没有对应的命令回包，只能当事件发出去。

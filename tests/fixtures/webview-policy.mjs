@@ -98,8 +98,9 @@ class Contents extends EventEmitter {
   isDestroyed() { return this.destroyed }
   stop() { this.stops++ }
   setWindowOpenHandler(callback) { this.openWindow = callback }
-  loadURL(url) { this.url = url; this.loads.push(url); return Promise.resolve() }
+  loadURL(url) { this.url = url; this.loads.push(url); this.emit('dom-ready'); return Promise.resolve() }
   getURL() { return this.url ?? '' }
+  isLoadingMainFrame() { return false }
   close() { this.destroyed = true; this.emit('destroyed') }
 }
 class Window extends EventEmitter {
@@ -415,7 +416,8 @@ async function managedGuest() {
   const page = runtime.webviews.get(41)
   assert.equal(page.id, 41)
   contents.url = url
-  contents.mainFrame = { url, origin: new URL(url).origin }
+  contents.emit('dom-ready')
+  contents.mainFrame = { url, origin: new URL(url).origin, executeJavaScript: script => contents.executeJavaScript(script) }
   assert.equal(page.contents, contents)
   contents.executeJavaScript = async script => ({ contentsId: contents.id, script })
   assert.deepEqual(await runtime.handle('webview.eval', { webviewId: 41, script: 'guest callback' }), { contentsId: contents.id, script: 'guest callback' })

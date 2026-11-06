@@ -1,4 +1,6 @@
 import { net, protocol } from 'electron'
+import { registerStandardSchemes } from './origin'
+import { AuthenticatedHosts } from './authenticated-host'
 import type { Protocol, Session } from 'electron'
 import type { Transport } from '../socket/transport'
 import type { Policies } from './policy'
@@ -38,6 +40,7 @@ export interface ProtocolHost {
 }
 
 export class Protocols {
+  readonly authenticatedHosts = new AuthenticatedHosts()
   private readonly registered = new Set<string>()
   private readonly prepared = new WeakSet<Session>()
   private readonly localhost = new WeakSet<Protocol>()
@@ -50,6 +53,7 @@ export class Protocols {
 
   /** 必须在 app.whenReady() 之前调用；schemes 来自 --tauri-schemes。 */
   static registerPrivileged(schemes: string[]): void {
+    registerStandardSchemes(schemes)
     protocol.registerSchemesAsPrivileged(schemes.filter((scheme, i, all) => /^[a-z][a-z0-9+.-]*$/.test(scheme) && all.indexOf(scheme) === i).map((scheme) => ({ scheme, privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } })))
   }
 
@@ -63,8 +67,8 @@ export class Protocols {
   }
 
   /** Authenticated IPC fetch: unlike session protocol handlers, this has a trusted webview identity. */
-  fetchIpc(request: Request, webviewId: number): Promise<Response> {
-    return this.dispatch('ipc', request, `ipc://localhost${new URL(request.url).pathname}${new URL(request.url).search}`, webviewId)
+  fetchIpc(request: Request, webviewId: number, documentGeneration?: number): Promise<Response> {
+    return this.dispatch('ipc', request, `ipc://localhost${new URL(request.url).pathname}${new URL(request.url).search}`, webviewId, documentGeneration)
   }
 
   /** protocol.respond */
@@ -96,7 +100,7 @@ export class Protocols {
    * 发起一次到 Rust 的请求并等待响应。
    * webviewId 为 undefined 时拒绝 `ipc://`：没带身份的调用无法判定归属。
    */
-  private async dispatch(scheme: string, request: Request, uri = request.url, webviewId?: number): Promise<Response> {
+  private async dispatch(scheme: string, request: Request, uri = request.url, webviewId?: number, documentGeneration?: number): Promise<Response> {
     if (this.disposed || (scheme === 'ipc' && webviewId === undefined)) return Response.error()
     const id = this.nextRequest++
     const body = Buffer.from(await request.arrayBuffer()).toString('base64')
@@ -106,7 +110,7 @@ export class Protocols {
     const initiator = (request as Request & { initiatorOrigin?: string }).initiatorOrigin
     if (typeof initiator === 'string') headers.origin = initiator
     const reply = new Promise<ProtocolResponse>((resolve) => this.pending.set(id, resolve))
-    this.host.transport.send('protocol.request', { id, scheme, webviewId, uri, method: request.method, headers, body })
+    this.host.transport.send('protocol.request', { id, scheme, webviewId, documentGeneration, uri, method: request.method, headers, body })
     const result = await reply
     const status = result.status ?? 200
     const responseHeaders = new Headers(result.headers ?? {})
@@ -123,6 +127,10 @@ export class Protocols {
     this.localhost.add(target)
     const fetch = (request: Request) => network.fetch(request, { bypassCustomProtocolHandlers: true })
     for (const transport of ['http', 'https'] as const) target.handle(transport, (request) => {
+      if ('protocol' in network) {
+        const authenticated = this.authenticatedHosts.route(network, request)
+        if (authenticated) return authenticated
+      }
       const url = new URL(request.url)
       const match = /^([a-z][a-z0-9+.-]*)\.localhost$/.exec(url.hostname)
       if (url.port || !match || !this.registered.has(match[1])) return fetch(request)

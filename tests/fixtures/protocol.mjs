@@ -117,6 +117,8 @@ switch (process.argv[2]) {
       senderEvents.push({ sender, senderFrame: frame })
       const contents = new EventEmitter()
       contents.id = contentsId
+      contents.getURL = () => url
+      contents.isLoadingMainFrame = () => false
       testContents.set(contentsId, contents)
       webviews.add(new Webview({}, webviewId, { webContents: contents }, { webviewId, url }))
       listeners.get('tauri-ipc')({ sender, senderFrame: frame }, 'ping')

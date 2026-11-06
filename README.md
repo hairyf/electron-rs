@@ -12,6 +12,10 @@ Set the trusted webview creation config’s `browserHost` to `true`, then call `
 
 Run `pnpm run build && pnpm run test:browser` for the isolated real-Electron regression (Linux requires a graphical session/Xvfb and the normal Electron sandbox setup).
 
+## Authenticated web hosts
+
+Create a webview with `authenticatedWebHostSession: true` before loading its local bootstrap document. Call `rpc::protocol::AuthenticateHost { url }` with the owned backend launch URL, then `BindHost { webview_id, host_id }` before navigating to the returned `document_url`. Authentication requires a 303 and Set-Cookie; registration returns only an opaque id and token-free URLs. Trusted Rust hosts may explicitly call `rpc::protocol::HostCookieHeader { host_id }` to reuse the same credential for backend HTTP clients or event streams; never expose this value to renderer commands or logs, and send it only to `backend_origin`. Each host webview uses a private, nonpersistent session. Exact backend HTTP requests stream through main-process fetch/Response; HTTP/WS headers are scoped to the bound webContents and backend origin. Unrelated guests never inherit this session; native popups requiring the authenticated opener session are rejected. `rpc::browser::SetTrustedOrigin { webview_id, origin }` revokes the local authenticated binding, closes the old browser leases, and selects a new HTTP(S) document origin or restores the webview’s original registered custom-protocol origin before host-controlled navigation. Other custom origins, opaque origins, credentials, paths, queries, and fragments are rejected. Bind the authenticated host again to return to it.
+
 ## Install
 
 Git-only; pin a revision or tag for release builds.
@@ -83,6 +87,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 - built-in requests live in `electron_rs::rpc::{app, window, webview, protocol}`; implement `RpcRequest` only for extensions
 
 ## JavaScript and processes
+
+Webview script evaluation waits for the current main document’s `dom-ready`, not for unrelated images or frames to finish loading. A cross-document navigation rejects pending evaluations from the previous document; same-document navigation preserves them. A denied navigation that retains the previous document restores its readiness when the attempt stops. Concurrent evaluations share readiness listeners, and closing the webview rejects any waiters.
 
 | API | Execution context | Input | Output |
 | --- | --- | --- | --- |

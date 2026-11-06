@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { documentOrigin } from './origin'
 import { Menu } from 'electron'
 import type { ContextMenuParams, Cookie, Event, Input, MenuItemConstructorOptions, Rectangle, WebContents, WebContentsView } from 'electron'
 import { cssColor, type Window } from './window'
@@ -26,6 +27,7 @@ type NativeContents = WebContents & { navigationHistory?: { canGoBack(): boolean
 
 export class Webview extends EventEmitter<WebviewEvents> {
   private main = false
+  private authenticatedOrigin?: string
   private autoResize: boolean
   private policy?: WebviewPolicy
   private reference?: { bounds: Rectangle; parent: Rectangle }
@@ -33,6 +35,11 @@ export class Webview extends EventEmitter<WebviewEvents> {
   private closed = false
   private nativePopup = false
   private openingDevtools?: Promise<void>
+  private evaluationReady?: Promise<void>
+  private documentReady = false
+  private retainedDocumentReady = false
+  private generation = 0
+  get documentGeneration(): number { return this.generation }
   private contextMenu?: Menu
   private settleTimer?: ReturnType<typeof setTimeout>
   private settleRound = 0
@@ -75,6 +82,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
     if (!view && !guest) throw new Error('webview requires a view or an adopted guest')
     this.adopted = guest !== undefined
     this.nativeContents = guest ?? view!.webContents
+    this.documentReady = Boolean(this.nativeContents.getURL()) && !this.nativeContents.isLoadingMainFrame()
     this.contentsId = this.nativeContents.id; this.autoResize = Boolean(config.autoResize); this.policy = config.policy
     this.attached = this.adopted
     this.bindEvents()
@@ -85,20 +93,26 @@ export class Webview extends EventEmitter<WebviewEvents> {
   setMain(main: boolean): void { this.main = main }
   get webviewPolicy(): WebviewPolicy | undefined { return this.policy }
   get initialUrl(): string { return this.config.url }
+  get authenticatedWebHost(): unknown { return this.config.authenticatedWebHost }
   get browserHost(): boolean { return this.config.browserHost === true }
+  get trustedOrigin(): string { return this.authenticatedOrigin ?? documentOrigin(this.initialUrl) }
+  setAuthenticatedOrigin(origin: string): void { this.authenticatedOrigin = origin }
   acceptsIpc(url: string): boolean {
-    const origin = this.browserHost ? new URL(this.initialUrl).origin : this.config.ipcOrigin
+    const origin = this.authenticatedOrigin ?? (this.browserHost ? this.trustedOrigin : this.config.ipcOrigin)
     if (typeof origin !== 'string') return true
-    try { return new URL(url).origin !== 'null' && new URL(url).origin === origin } catch { return false }
+    try { return documentOrigin(url) !== 'null' && documentOrigin(url) === origin } catch { return false }
   }
   private bindEvents(): void {
     const c = this.contents
     c.on('context-menu', this.onContextMenu)
     c.on('before-input-event', this.onBeforeInput)
-    c.on('did-navigate', (_e, url) => this.emit('navigationCommitted', url))
+    c.on('did-navigate', (_e, url) => { this.retainedDocumentReady = false; this.emit('navigationCommitted', url) })
     c.on('did-navigate-in-page', (_e, url, isMain) => { if (isMain) this.emit('navigationCommitted', url) })
-    c.on('dom-ready', () => { if (this.attached) this.syncOwnerState() })
-    c.on('did-start-navigation', (_event, url, inPlace, mainFrame) => { if (mainFrame && !inPlace) this.emit('loadStarted', url) })
+    c.on('dom-ready', () => { this.retainedDocumentReady = false; this.documentReady = true; if (this.attached) this.syncOwnerState() })
+    c.on('did-stop-loading', () => { if (this.retainedDocumentReady) { this.documentReady = true; this.retainedDocumentReady = false } })
+    c.on('did-start-navigation', (_event, url, inPlace, mainFrame) => {
+      if (mainFrame && !inPlace) { this.retainedDocumentReady ||= this.documentReady; this.documentReady = false; this.generation++; this.emit('loadStarted', url) }
+    })
     c.on('did-finish-load', () => this.emit('loadFinished', c.getURL()))
     c.on('did-fail-load', (_event, code, _description, url, mainFrame) => { if (mainFrame && code !== -3) this.emit('loadFailed', url) })
     c.on('page-title-updated', (_e, title) => this.emit('titleChanged', title))
@@ -170,7 +184,34 @@ export class Webview extends EventEmitter<WebviewEvents> {
     if (image.isEmpty()) throw new Error('webview capture returned an empty image')
     return image.toDataURL()
   }
-  evaluate(script: string): Promise<unknown> { return this.contents.executeJavaScript(script, true) }
+  async evaluate(script: string, documentGeneration = this.generation): Promise<unknown> {
+    const contents = this.contents
+    if (documentGeneration !== this.generation) throw new Error('webview document replaced before script evaluation')
+    if (contents.isDestroyed()) throw new Error('webview destroyed before script evaluation')
+    if (!this.documentReady) {
+      this.evaluationReady ??= new Promise<void>((resolve, reject) => {
+        const finish = (error?: Error) => {
+          contents.removeListener('dom-ready', loaded)
+          contents.removeListener('did-stop-loading', stopped)
+          contents.removeListener('destroyed', destroyed)
+          contents.removeListener('did-start-navigation', navigated)
+          if (error) reject(error)
+          else resolve()
+        }
+        const loaded = () => finish()
+        const stopped = () => { if (this.documentReady) finish() }
+        const navigated = (_event: unknown, _url: string, inPlace: boolean, mainFrame: boolean) => { if (mainFrame && !inPlace) finish(new Error('webview document replaced before script evaluation')) }
+        const destroyed = () => finish(new Error('webview destroyed before script evaluation'))
+        contents.once('dom-ready', loaded)
+        contents.on('did-stop-loading', stopped)
+        contents.once('destroyed', destroyed)
+        contents.on('did-start-navigation', navigated)
+      }).finally(() => { this.evaluationReady = undefined })
+      await this.evaluationReady
+    }
+    if (documentGeneration !== this.generation) throw new Error('webview document replaced before script evaluation')
+    return contents.mainFrame.executeJavaScript(script, true)
+  }
   snapshot(): WebviewSnapshot {
     const scaleFactor = this.owner.scale, contentBounds = this.owner.native.getContentBounds()
     if (this.adopted) return { scaleFactor, bounds: this.physical(contentBounds, scaleFactor), contentBounds: this.physical(contentBounds, scaleFactor), visible: !this.owner.destroyed && !this.contents.isDestroyed() }

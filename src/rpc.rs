@@ -636,7 +636,7 @@ pub mod webview {
   requests! {
     Create { window_id: u32, #[serde(flatten)] config: Config } => Created, "webview.create", deferred = true;
     Url { webview_id: u32 } => String, "webview.url";
-    Eval { webview_id: u32, script: String } => Value, "webview.eval", deferred = true;
+    Eval { webview_id: u32, script: String, #[serde(skip_serializing_if = "Option::is_none")] document_generation: Option<u64> } => Value, "webview.eval", deferred = true;
     NewWindowResponse { id: u64, response: NewWindowDecision } => (), "webview.newWindowResponse";
     NavigationResponse { id: u64, allow: bool } => (), "webview.navigationResponse";
     DownloadResponse {
@@ -679,6 +679,7 @@ pub mod browser {
   #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
   pub struct Reservation { pub lease: String, pub partition: String }
   requests! {
+    SetTrustedOrigin { webview_id: u32, origin: String } => (), "webview.trustedOrigin", deferred = true;
     Acquire { webview_id: u32, workspace: String } => Reservation, "browser.acquire", deferred = true;
     Release { webview_id: u32, lease: String } => (), "browser.release", deferred = true;
   }
@@ -688,7 +689,14 @@ pub mod browser {
 pub mod protocol {
   use super::*;
 
+  #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+  #[serde(rename_all = "camelCase")]
+  pub struct AuthenticatedHost { pub id: String, pub document_url: String, pub backend_origin: String }
+
   requests! {
+    AuthenticateHost { url: String } => AuthenticatedHost, "webHost.authenticate", deferred = true;
+    HostCookieHeader { host_id: String } => String, "webHost.cookieHeader", deferred = true;
+    BindHost { webview_id: u32, host_id: String } => (), "webHost.bind";
     Register { scheme: String } => (), "protocol.register";
     Respond {
       id: u64,
@@ -1119,7 +1127,7 @@ mod tests {
     assert!(window::QueryTheme { window_id: 1 }.deferred());
     assert!(webview::Eval {
       webview_id: 1,
-      script: String::new()
+      script: String::new(), document_generation: None
     }
     .deferred());
     assert!(webview::OpenDevtools { webview_id: 1 }.timeout().as_secs() > 10);

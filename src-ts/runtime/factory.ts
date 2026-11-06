@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import { BrowserGuests } from './browser'
+import { documentOrigin } from './origin'
 import os from 'node:os'
 import path from 'node:path'
 import { app, BaseWindow, nativeImage, session, WebContentsView } from 'electron'
@@ -16,6 +17,7 @@ export interface WindowFactory {
   closeWebview(webviewId: number): void
   acquireBrowserGuest(webviewId: number, workspace: unknown): { lease: string; partition: string }
   releaseBrowserGuest(webviewId: number, lease: unknown): Promise<void>
+  setTrustedOrigin(webviewId: number, origin: unknown): Promise<void>
 }
 
 export interface FactoryDependencies {
@@ -49,6 +51,18 @@ export class Factory implements WindowFactory {
     return this.browser.release(this.deps.webviews.get(webviewId), lease)
   }
 
+  async setTrustedOrigin(webviewId: number, value: unknown): Promise<void> {
+    if (typeof value !== 'string') throw new Error('invalid trusted document origin')
+    const owner = this.deps.webviews.get(webviewId)
+    const origin = new URL(value)
+    const normalized = documentOrigin(value)
+    const initial = normalized !== 'null' && normalized === documentOrigin(owner.initialUrl)
+    if ((!['http:', 'https:'].includes(origin.protocol) && !initial) || origin.username || origin.password || !['', '/'].includes(origin.pathname) || origin.search || origin.hash) throw new Error('invalid trusted document origin')
+    this.deps.protocols.authenticatedHosts.unbind(owner)
+    await this.browser.releaseAll(owner)
+    owner.setAuthenticatedOrigin(normalized)
+  }
+
   createWindow(params: Params): { windowId: number } {
     const { windowId } = params
     if (!Number.isSafeInteger(windowId) || this.deps.windows.peek(windowId)) throw new Error('invalid or duplicate window ID')
@@ -67,6 +81,7 @@ export class Factory implements WindowFactory {
     if (popup && (!Number.isSafeInteger(params.newWindowRequest) || !active || active.request !== params.newWindowRequest || this.deps.popups.has(active.request))) throw new Error('invalid or consumed native popup opener')
     const webview = params.webview as WebviewInit | undefined
     if (popup && !webview) throw new Error('native popup requires a main webview')
+    if (popup && this.deps.protocols.authenticatedHosts.ownsSession(active!.opener.contents.session)) throw new Error('authenticated web hosts require independent popup sessions')
     const targetSession = this.sessionFor(webview)
     if (popup && targetSession && targetSession !== active?.opener.contents.session) throw new Error('native popup target session must match its opener; incognito/dataDirectory cannot be changed')
     const options = this.browserWindowOptions(config, params, popup ? active!.opener.contents.session : targetSession ?? session.defaultSession)
@@ -123,7 +138,8 @@ export class Factory implements WindowFactory {
       return { webviewId }
     }
     const config = { ...window.configuration, ...Object.fromEntries(Object.entries(params).filter(([, value]) => value != null)) } as WindowConfig
-    const targetSession = this.sessionFor(init) ?? this.deps.webviews.main(window)?.contents.session ?? session.defaultSession
+    const inheritedSession = this.deps.webviews.main(window)?.contents.session
+    const targetSession = this.sessionFor(init) ?? (inheritedSession && !this.deps.protocols.authenticatedHosts.ownsSession(inheritedSession) ? inheritedSession : session.defaultSession)
     const webPreferences = this.webPreferences(init, config, targetSession)
     const view = new WebContentsView({ webPreferences })
     const webview = new Webview(window, webviewId, view, init, webPreferences?.devTools)
@@ -161,7 +177,8 @@ export class Factory implements WindowFactory {
   private sessionFor(params?: Params | null): Session | undefined {
     if (!params) return undefined
     let target: Session | undefined
-    if (params.incognito) target = session.fromPartition(`tauri-private-${++Factory.nextPrivateSession}`)
+    if (params.authenticatedWebHostSession) target = this.deps.protocols.authenticatedHosts.createSession()
+    else if (params.incognito) target = session.fromPartition(`tauri-private-${++Factory.nextPrivateSession}`)
     else if (params.dataDirectory) target = session.fromPath(path.resolve(params.dataDirectory))
     if (target && !this.customSessions.has(target)) {
       this.customSessions.add(target)
@@ -252,6 +269,7 @@ export class Factory implements WindowFactory {
 
   private wireWebview(webview: Webview): void {
     const { id } = webview
+    if (webview.authenticatedWebHost) this.deps.protocols.authenticatedHosts.bind(webview, webview.authenticatedWebHost)
     webview.on('navigationCommitted', (url) => this.deps.transport.send('webview.navigationCommitted', { webviewId: id, url }))
     webview.on('loadStarted', (url) => this.deps.transport.send('webview.loadStarted', { webviewId: id, url }))
     webview.on('loadFinished', (url) => this.deps.transport.send('webview.loadFinished', { webviewId: id, url }))
@@ -276,6 +294,8 @@ export class Factory implements WindowFactory {
       const initial = new URL(webview.initialUrl)
       if (!current.host || current.protocol !== initial.protocol || current.host !== initial.host) { event.preventDefault(); return }
       preferences.preload = plan.preload
+      const targetSession = this.sessionFor(plan.init)
+      if (targetSession) preferences.session = targetSession
       preferences.webviewTag = plan.init.browserHost === true
       preferences.nodeIntegrationInSubFrames = false
       const instanceId = params?.instanceId
@@ -303,6 +323,7 @@ export class Factory implements WindowFactory {
   }
 
   private guestPreferences(host: Webview, preferences: WebPreferences): void {
+    if (this.deps.protocols.authenticatedHosts.ownsSession(host.contents.session)) preferences.session = session.defaultSession
     preferences.preload = path.join(__dirname, '..', 'preload.cjs')
     preferences.contextIsolation = true
     preferences.sandbox = true

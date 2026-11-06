@@ -94,6 +94,8 @@ context.handle = runtime.handle
 const { policies, webviews } = runtime
 const { Webview } = runtime.load('./runtime/webview.cjs')
 const contents = new EventEmitter(); contents.id = 7
+contents.getURL = () => ''
+contents.isLoadingMainFrame = () => false
 const view = { webContents: contents }
 webviews.add(new Webview({}, 70, view, { webviewId: 70, url: '', policy: { download: true } }))
 policies.install(target)

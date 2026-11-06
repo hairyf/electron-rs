@@ -47,9 +47,9 @@ fn ipc_authenticates_native_senders_and_preserves_binary_bytes() {
   assert_eq!(result["anonymous"], json!(["error", "error"]));
   assert_eq!(result["anonymousRequests"], 0);
   assert_eq!(result["acceptedMessages"], json!([
-    {"webviewId": 1, "url": "http://tauri.localhost/", "body": "ping"},
-    {"webviewId": 2, "url": "tauri://localhost/second", "body": "ping"},
-    {"webviewId": 3, "url": "https://remote.example/", "body": "ping"},
+    {"webviewId": 1, "documentGeneration": 0, "url": "http://tauri.localhost/", "body": "ping"},
+    {"webviewId": 2, "documentGeneration": 0, "url": "tauri://localhost/second", "body": "ping"},
+    {"webviewId": 3, "documentGeneration": 0, "url": "https://remote.example/", "body": "ping"},
   ]));
   assert_eq!(result["rejectedMessages"], 0);
   let binary = result["binary"].as_array().unwrap();
@@ -57,7 +57,7 @@ fn ipc_authenticates_native_senders_and_preserves_binary_bytes() {
   for (index, origin) in ["http://tauri.localhost", "tauri://localhost", "https://remote.example"].into_iter().enumerate() {
     let item = &binary[index];
     assert_eq!(item["sent"], json!({
-      "event": "protocol.request", "scheme": "ipc", "webviewId": index + 1, "uri": "ipc://localhost/echo?v=1", "method": "POST",
+      "event": "protocol.request", "scheme": "ipc", "webviewId": index + 1, "documentGeneration": 0, "uri": "ipc://localhost/echo?v=1", "method": "POST",
       "headers": {"origin": origin, "tauri-invoke-key": "test-key", "content-type": "application/octet-stream", "x-test": "request"},
       "body": [0, 1, 127, 128, 255],
     }));

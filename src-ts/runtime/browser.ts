@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { documentOrigin } from './origin'
 import { session } from 'electron'
 import type { WebContents } from 'electron'
 import type { Webview } from './webview'
@@ -14,8 +15,8 @@ export class BrowserGuests {
   constructor(private readonly transport: Transport) {}
 
   private owner(owner: Webview): void {
-    const origin = this.hosts.get(owner)
-    if (!origin || owner.contents.isDestroyed() || new URL(owner.contents.getURL()).origin !== origin) throw new Error('browser guest: untrusted owner')
+    const origin = this.hosts.has(owner) ? owner.trustedOrigin : undefined
+    if (!origin || owner.contents.isDestroyed() || documentOrigin(owner.contents.getURL()) !== origin) throw new Error('browser guest: untrusted owner')
   }
 
   acquire(owner: Webview, workspace: unknown): { lease: string; partition: string } {
@@ -47,6 +48,10 @@ export class BrowserGuests {
     return { lease, partition }
   }
 
+  async releaseAll(owner: Webview): Promise<void> {
+    await Promise.all([...this.leases].filter(([, lease]) => lease.owner === owner).map(([id]) => this.close(id)))
+  }
+
   async release(owner: Webview, id: unknown): Promise<void> {
     this.owner(owner)
     if (typeof id !== 'string') throw new Error('browser guest: invalid lease')
@@ -69,8 +74,8 @@ export class BrowserGuests {
 
   private applicationHost(url: URL): boolean {
     if (['ipc.localhost', 'tauri.localhost'].includes(url.hostname)) return true
-    return [...this.hosts.values()].some(value => {
-      const host = new URL(value)
+    return [...this.hosts.keys()].some(owner => {
+      const host = new URL(owner.trustedOrigin)
       return url.port === host.port && (url.hostname === host.hostname || ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
     })
   }
@@ -83,7 +88,7 @@ export class BrowserGuests {
   }
 
   bind(owner: Webview): void {
-    const origin = new URL(owner.initialUrl).origin
+    const origin = owner.trustedOrigin
     if (origin === 'null') throw new Error('browser guest: host requires a document origin')
     this.hosts.set(owner, origin)
     const contents = owner.contents
@@ -98,7 +103,7 @@ export class BrowserGuests {
     contents.on('will-attach-webview', (event, preferences, params) => {
       const id = typeof params.src === 'string' && params.src.startsWith('about:blank#') ? params.src.slice(12) : ''
       const lease = this.leases.get(id)
-      if (!lease || lease.owner !== owner || lease.frame !== contents.mainFrame || lease.attached || params.partition !== lease.partition || new URL(contents.getURL()).origin !== origin) { event.preventDefault(); return }
+      if (!lease || lease.owner !== owner || lease.frame !== contents.mainFrame || lease.attached || params.partition !== lease.partition || documentOrigin(contents.getURL()) !== owner.trustedOrigin) { event.preventDefault(); return }
       const instanceId: unknown = params.instanceId
       if (typeof instanceId !== 'number' || !Number.isSafeInteger(instanceId) || attachments.has(instanceId)) { event.preventDefault(); return }
       attachments.set(instanceId, id)
@@ -126,7 +131,7 @@ export class BrowserGuests {
       })
       guest.setWindowOpenHandler(({ url, postBody }) => {
         const lease = attachedId ? this.leases.get(attachedId) : undefined
-        if (lease?.guest === guest && !contents.isDestroyed() && lease.frame === contents.mainFrame && new URL(contents.getURL()).origin === origin && postBody === undefined && this.navigation(url)) {
+        if (lease?.guest === guest && !contents.isDestroyed() && lease.frame === contents.mainFrame && documentOrigin(contents.getURL()) === owner.trustedOrigin && postBody === undefined && this.navigation(url)) {
           this.transport.send('browser.openRequested', { webviewId: owner.id, lease: attachedId, url: new URL(url).href })
         }
         return { action: 'deny' }

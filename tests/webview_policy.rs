@@ -204,7 +204,7 @@ fn generated_preloads_scope_initialization_and_ipc_to_the_right_frames() {
     observed["messages"],
     json!([{
       "event": "ipc.message",
-      "params": { "webviewId": 10, "url": "https://page.invalid/", "body": "main message" },
+      "params": { "webviewId": 10, "documentGeneration": 0, "url": "https://page.invalid/", "body": "main message" },
     }]),
     "non-main, unknown and opaque senders never emit IPC"
   );
@@ -360,7 +360,7 @@ fn webview_tag_guests_reach_policy_ipc_and_cleanup() {
     assert_eq!(
         observed["ipcMessages"],
         json!([{ "event": "ipc.message", "params": {
-            "webviewId": 1_048_576, "url": "https://page.invalid/", "body": "guest message",
+            "webviewId": 1_048_576, "documentGeneration": 0, "url": "https://page.invalid/", "body": "guest message",
         } }])
     );
     assert_eq!(observed["navigation"]["request"]["webviewId"], 1_048_576);
