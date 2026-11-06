@@ -16,6 +16,12 @@ export interface WebviewEvents {
 
 type NativeView = WebContentsView & { getVisible?(): boolean; setVisible?(visible: boolean): void }
 const sameRect = (a: Rectangle, b: Rectangle): boolean => a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height
+// Linux 最大化/还原时 Electron 先派发 resize，随后才更新 contentBounds：只按事件
+// 当时的尺寸收敛会让子视图停在旧矩形，需要在事件之后补几帧重读父窗口几何。
+const GEOMETRY_EVENTS = ['resize', 'maximize', 'unmaximize', 'restore', 'enter-full-screen', 'leave-full-screen'] as const
+const GEOMETRY_SETTLE_DELAY = 16
+const GEOMETRY_SETTLE_ROUNDS = 32
+const GEOMETRY_SETTLE_STABLE = 2
 type NativeContents = WebContents & { navigationHistory?: { canGoBack(): boolean; goBack(): void; canGoForward(): boolean; goForward(): void } }
 
 export class Webview extends EventEmitter<WebviewEvents> {
@@ -28,6 +34,10 @@ export class Webview extends EventEmitter<WebviewEvents> {
   private nativePopup = false
   private openingDevtools?: Promise<void>
   private contextMenu?: Menu
+  private settleTimer?: ReturnType<typeof setTimeout>
+  private settleRound = 0
+  private settleStable = 0
+  private settledParent?: Rectangle
   private readonly onContextMenu = (_event: Event, params: ContextMenuParams) => {
     if (this.closed || this.contents.isDestroyed() || this.owner.destroyed) return
     const flags = params.editFlags
@@ -59,7 +69,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
   readonly contentsId: number
   /** Chromium owns the guest's view and layout; only events and policy are ours. */
   readonly adopted: boolean
-  private readonly onResize = () => { if (!this.owner.destroyed) this.resizeWithParent(this.owner.native.getContentBounds()) }
+  private readonly onResize = () => this.syncParentGeometry()
   constructor(private owner: Window, readonly id: number, readonly view: WebContentsView | undefined, private config: WebviewInit, private readonly devtoolsEnabled = true, guest?: WebContents) {
     super()
     if (!view && !guest) throw new Error('webview requires a view or an adopted guest')
@@ -110,7 +120,8 @@ export class Webview extends EventEmitter<WebviewEvents> {
     if (config.userAgent != null) this.contents.setUserAgent(String(config.userAgent))
     this.owner.native.contentView.addChildView(view)
     this.attached = true
-    this.owner.native.on('resize', this.onResize)
+    const emitter = this.owner.native as unknown as NodeJS.EventEmitter
+    for (const event of GEOMETRY_EVENTS) emitter.on(event, this.onResize)
     const parent = this.owner.native.getContentBounds()
     const input = this.config.bounds ?? {}
     const position = input.position ?? { x: 0, y: 0 }
@@ -121,6 +132,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
       width: this.toDip(size.width, input.size ? input.size.physical ?? input.physical : false),
       height: this.toDip(size.height, input.size ? input.size.physical ?? input.physical : false),
     })
+    this.settledParent = parent
     this.syncOwnerState()
     if (options.navigate !== false && this.config.url) this.navigate(this.config.url)
     return Promise.resolve()
@@ -131,7 +143,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
   }
   detach(): void {
     if (!this.attached || this.adopted) return
-    this.owner.native.removeListener('resize', this.onResize)
+    this.releaseGeometry()
     if (!this.owner.destroyed) this.owner.native.contentView.removeChildView(this.view!)
     this.attached = false
   }
@@ -205,6 +217,39 @@ export class Webview extends EventEmitter<WebviewEvents> {
     if (!this.attached || this.adopted || !this.autoResize || !this.reference || parent.width <= 0 || parent.height <= 0) return
     this.scaleTo(parent)
   }
+  private syncParentGeometry(): void {
+    if (this.closed || this.owner.destroyed || !this.attached || this.adopted) return
+    this.settleRound = 0
+    this.settleStable = 0
+    this.applyParentGeometry()
+    this.armSettle()
+  }
+  private applyParentGeometry(): boolean {
+    const parent = this.owner.native.getContentBounds()
+    if (this.settledParent && sameRect(this.settledParent, parent)) return false
+    this.settledParent = parent
+    this.resizeWithParent(parent)
+    return true
+  }
+  private armSettle(): void {
+    if (this.settleTimer || this.settleRound >= GEOMETRY_SETTLE_ROUNDS) return
+    this.settleTimer = setTimeout(() => {
+      this.settleTimer = undefined
+      if (this.closed || this.owner.destroyed || !this.attached || this.adopted) return
+      this.settleRound += 1
+      this.settleStable = this.applyParentGeometry() ? 0 : this.settleStable + 1
+      if (this.settleStable < GEOMETRY_SETTLE_STABLE) this.armSettle()
+    }, GEOMETRY_SETTLE_DELAY)
+  }
+  private releaseGeometry(): void {
+    const emitter = this.owner.native as unknown as NodeJS.EventEmitter
+    for (const event of GEOMETRY_EVENTS) emitter.removeListener(event, this.onResize)
+    if (this.settleTimer) clearTimeout(this.settleTimer)
+    this.settleTimer = undefined
+    this.settleRound = 0
+    this.settleStable = 0
+    this.settledParent = undefined
+  }
   setVisible(visible: boolean): void { if (this.adopted) return; (this.view as NativeView).setVisible?.(visible) }
   setBackgroundColor(color: string | undefined): void { if (this.adopted) return; this.view!.setBackgroundColor(color ?? '#00000000') }
   focus(): void { this.owner.focus(); this.contents.focus() }
@@ -268,8 +313,13 @@ export class Webview extends EventEmitter<WebviewEvents> {
       throw error
     }
     if (this.attached) {
-      previousOwner.native.removeListener('resize', this.onResize)
-      destination.native.on('resize', this.onResize)
+      const previousEmitter = previousOwner.native as unknown as NodeJS.EventEmitter
+      const destinationEmitter = destination.native as unknown as NodeJS.EventEmitter
+      for (const event of GEOMETRY_EVENTS) {
+        previousEmitter.removeListener(event, this.onResize)
+        destinationEmitter.on(event, this.onResize)
+      }
+      this.settledParent = destination.native.getContentBounds()
     }
     this.syncOwnerState()
     this.emit('reparented', previousOwner)
