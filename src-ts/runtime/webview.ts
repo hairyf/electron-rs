@@ -28,6 +28,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
   private closed = false
   private nativePopup = false
   private openingDevtools?: Promise<void>
+  private evaluationReady?: Promise<void>
   private contextMenu?: Menu
   private readonly onContextMenu = (_event: Event, params: ContextMenuParams) => {
     if (this.closed || this.contents.isDestroyed() || this.owner.destroyed) return
@@ -162,7 +163,26 @@ export class Webview extends EventEmitter<WebviewEvents> {
     if (image.isEmpty()) throw new Error('webview capture returned an empty image')
     return image.toDataURL()
   }
-  evaluate(script: string): Promise<unknown> { return this.contents.executeJavaScript(script, true) }
+  async evaluate(script: string): Promise<unknown> {
+    const contents = this.contents
+    if (contents.isDestroyed()) throw new Error('webview destroyed before script evaluation')
+    if (!contents.getURL() || contents.isLoadingMainFrame()) {
+      this.evaluationReady ??= new Promise<void>((resolve, reject) => {
+        const finish = (error?: Error) => {
+          contents.removeListener('did-stop-loading', loaded)
+          contents.removeListener('destroyed', destroyed)
+          if (error) reject(error)
+          else resolve()
+        }
+        const loaded = () => finish()
+        const destroyed = () => finish(new Error('webview destroyed before script evaluation'))
+        contents.once('did-stop-loading', loaded)
+        contents.once('destroyed', destroyed)
+      }).finally(() => { this.evaluationReady = undefined })
+      await this.evaluationReady
+    }
+    return contents.executeJavaScript(script, true)
+  }
   snapshot(): WebviewSnapshot {
     const scaleFactor = this.owner.scale, contentBounds = this.owner.native.getContentBounds()
     if (this.adopted) return { scaleFactor, bounds: this.physical(contentBounds, scaleFactor), contentBounds: this.physical(contentBounds, scaleFactor), visible: !this.owner.destroyed && !this.contents.isDestroyed() }

@@ -100,6 +100,7 @@ class Contents extends EventEmitter {
   setWindowOpenHandler(callback) { this.openWindow = callback }
   loadURL(url) { this.url = url; this.loads.push(url); return Promise.resolve() }
   getURL() { return this.url ?? '' }
+  isLoadingMainFrame() { return false }
   close() { this.destroyed = true; this.emit('destroyed') }
 }
 class Window extends EventEmitter {

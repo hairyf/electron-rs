@@ -23,7 +23,7 @@ try {
   })
   assert.equal(output.code, 0, output.stderr)
   assert.match(output.stderr, /native authenticated-host: PASS/)
-  assert.doesNotMatch(output.stderr, /UnhandledPromiseRejection|navigate failed/)
+  assert.doesNotMatch(output.stderr, /UnhandledPromiseRejection|navigate failed|MaxListenersExceededWarning/)
   console.log('native authenticated-host: PASS')
 } finally {
   rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })

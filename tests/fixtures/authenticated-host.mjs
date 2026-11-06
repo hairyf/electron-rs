@@ -11,10 +11,13 @@ assert.ok(home, 'native fixture requires an isolated userData directory')
 app.setPath('userData', home)
 const received = []
 let streamClosed = Promise.withResolvers()
+let slowRequest = Promise.withResolvers()
 const server = createServer((request, response) => {
   received.push({ url: request.url, cookie: request.headers.cookie, origin: request.headers.origin })
   if (request.url === '/?token=owned') {
     response.writeHead(303, { 'set-cookie': 'auth=private; HttpOnly', location: '/' }); response.end()
+  } else if (request.url === '/slow') {
+    slowRequest.resolve(() => response.end('<!doctype html><body>slow document</body>'))
   } else if (request.url === '/stream') {
     response.writeHead(200, { 'content-type': 'text/event-stream' }); response.write('first')
     request.once('close', () => { response.end(); streamClosed.resolve() })
@@ -95,6 +98,23 @@ try {
   await once(other.contents, 'did-finish-load')
   await other.contents.loadURL(origin)
   assert.equal(received.at(-1).cookie, undefined)
+  const navigation = other.contents.loadURL(origin + '/slow')
+  const finish = await slowRequest.promise
+  const baseline = other.contents.listenerCount('did-stop-loading')
+  const evaluations = Array.from({ length: 12 }, (_, index) => other.evaluate(String(index)))
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(other.contents.listenerCount('did-stop-loading'), baseline + 1)
+  finish()
+  await navigation
+  assert.deepEqual(await Promise.all(evaluations), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+  assert.equal(other.contents.listenerCount('did-stop-loading'), 0)
+  slowRequest = Promise.withResolvers()
+  const closingNavigation = other.contents.loadURL(origin + '/slow').catch(error => error)
+  await slowRequest.promise
+  const waiting = assert.rejects(other.evaluate('1'), /destroyed before script evaluation/)
+  other.contents.close({ waitForBeforeUnload: false })
+  await waiting
+  await closingNavigation
   windows.get(1).destroy()
   console.error('native authenticated-host: PASS')
   clearTimeout(deadline)

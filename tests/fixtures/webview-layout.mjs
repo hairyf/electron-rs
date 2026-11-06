@@ -79,6 +79,7 @@ class Contents extends EventEmitter {
   }
   loadURL(url) { this.calls.push({ method: 'loadURL', value: url }); this.url = url; return Promise.resolve() }
   getURL() { return this.url ?? '' }
+  isLoadingMainFrame() { return false }
   getLastWebPreferences() { return {} }
   inspectElement(x, y) { this.inspected = { x, y }; this.openDevTools() }
   executeJavaScript(script) {
