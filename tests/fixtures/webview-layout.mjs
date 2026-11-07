@@ -659,6 +659,11 @@ switch (process.argv[2]) {
     const invalidReplies = replies.splice(0)
     ready()
     await settle()
+    const handshake = replies.splice(0)
+    assert.equal(handshake.length, 1)
+    assert.equal(handshake[0].event, 'ready')
+    assert.equal(handshake[0].params.electron, 'fixture')
+    assert.ok(handshake[0].params.token === '0123456789abcdef'.repeat(4), 'ready credential must match the VM fixture launch credential')
     let closeCalls = 0
     let reading = false
     const closeDuringRead = []
