@@ -172,6 +172,11 @@ if (!isMainThread) {
     transport.on('close', () => { closes++ })
     assert.throws(() => transport.request('malformed', {}, 3_000), /host IPC closed/)
     await until(() => closes === 3)
+    const acceptedBeforeRejection = received.filter(message => message.accepted).length
+    transport = new IPC(port, Promise.reject(new Error('native initialization failed')))
+    transport.on('close', () => { closes++ })
+    await until(() => closes === 4)
+    assert.equal(received.filter(message => message.accepted).length, acceptedBeforeRejection, 'rejected initialization must not connect a peer')
     console.log('IPC transport: handshake, async, queued/reentrant nested RPC, timeout/stale reply, disconnect, worker exception, invalid JSON passed')
   } finally {
     transport?.close()
