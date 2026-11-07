@@ -49,6 +49,7 @@ export class AuthenticatedHosts {
   }
 
   bind(owner: Webview, id: unknown): void {
+    if (owner.trustedNavigationPending) throw new Error('trusted navigation already pending')
     const binding = this.sessions.get(owner.contents.session)
     const host = typeof id === 'string' ? this.hosts.get(id) : undefined
     if (!binding || !host || (binding.owner && binding.owner !== owner)) throw new Error('Host binding requires its own authenticated webview session')
