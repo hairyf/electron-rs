@@ -58,6 +58,10 @@ export function createRuntime(context, electron, options = {}) {
   context.process.argv ??= ['node', 'main.cjs', '--port', '1']
   context.process.env ??= {}
   context.process.versions ??= { electron: 'fixture' }
+  if (context.process.platform === 'linux') {
+    electron.app.getName ??= () => 'electron'
+    electron.app.setDesktopName ??= () => {}
+  }
   const { windows, webviews, downloads, popups, transport, environment, policies, protocols, factory, commands } = load.load(path.join(assets, 'main.cjs'))
   // Cases change the injected OS to exercise platform branches, never the host OS.
   Object.defineProperty(environment, 'platform', { get: () => context.process.platform })
