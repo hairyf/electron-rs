@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc -p tsconfig.electron.json",
-    "test:lifecycle": "node tests/checks/lifecycle.mjs",
+    "test:lifecycle": "node tests/checks/lifecycle.mjs && node tests/checks/startup-authentication-native.mjs",
     "test:browser": "node tests/fixtures/browser-guest.mjs && node tests/checks/authenticated-handoff-native.mjs",
     "test:authenticated-host": "node tests/checks/authenticated-host-native.mjs",
     "test": "pnpm run test:checks && cargo test --locked",

@@ -77,7 +77,10 @@ const ready = app.whenReady().then(() => {
   Menu.setApplicationMenu(null)
   policies.install(session.defaultSession)
 })
-const ipc = new IPC(port, ready)
+const authenticated = ready.then(() => {
+  transport.send('ready', { electron: process.versions.electron, token: credential })
+})
+const ipc = new IPC(port, authenticated)
 
 // transport 才负责「请求 → 查表 → 回包」，是唯一能被替身替换的接缝。
 const transport = new Transport(ipc)
@@ -164,12 +167,6 @@ downloads.on('finished', (payload) => transport.send('download.finished', payloa
 
 // ── 生命周期 ───────────────────────────────────────────────────────────────
 // 每一条都对应一个所有权判断，所以集中在这里。
-// 握手后 Rust 即可调用原生 API，必须先完成 Electron 初始化。
-transport.onConnect(async () => {
-  await ready
-  transport.send('ready', { electron: process.versions.electron, token: credential })
-})
-
 // 连接断开即退出：窗口寿命归 Rust，socket 断了就没有继续存在的理由。
 transport.onClose(() => {
   protocols.dispose()
