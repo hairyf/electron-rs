@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #include <pthread.h>
+#include <dispatch/dispatch.h>
 #include <stdint.h>
 #include <string.h>
 #include <cmath>
@@ -17,7 +18,6 @@
 @property(nonatomic, strong) id willEnterFullScreenObserver;
 @property(nonatomic, strong) id willExitFullScreenObserver;
 @property(nonatomic, strong) id didExitFullScreenObserver;
-@property(nonatomic, strong) id didFailEnterFullScreenObserver;
 - (void)apply;
 - (void)unhook;
 @end
@@ -104,7 +104,6 @@ static Class dsh_inset_subclass(Class base) {
   if (self.willEnterFullScreenObserver) [center removeObserver:self.willEnterFullScreenObserver];
   if (self.willExitFullScreenObserver) [center removeObserver:self.willExitFullScreenObserver];
   if (self.didExitFullScreenObserver) [center removeObserver:self.didExitFullScreenObserver];
-  if (self.didFailEnterFullScreenObserver) [center removeObserver:self.didFailEnterFullScreenObserver];
 }
 @end
 
@@ -274,17 +273,21 @@ napi_value set_traffic_light_position(napi_env env, napi_callback_info info) {
       __weak DSHWindowButtonInset* inset = layout;
       layout.willEnterFullScreenObserver = [center addObserverForName:NSWindowWillEnterFullScreenNotification object:window queue:nil usingBlock:^(NSNotification* note) {
         [inset unhook];
+        // A cancelled transition posts no notification at all (AppKit only offers the
+        // NSWindowDelegate callback for it), so re-check once the animation is over: the
+        // window is either fullscreen, where apply is a no-op, or back to a windowed
+        // layout the inset has to restore.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+          NSWindow* target = inset.window;
+          if (!target || (target.styleMask & NSWindowStyleMaskFullScreen)) return;
+          inset.suspended = NO;
+          [inset apply];
+        });
       }];
       layout.willExitFullScreenObserver = [center addObserverForName:NSWindowWillExitFullScreenNotification object:window queue:nil usingBlock:^(NSNotification* note) {
         [inset unhook];
       }];
       layout.didExitFullScreenObserver = [center addObserverForName:NSWindowDidExitFullScreenNotification object:window queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* note) {
-        inset.suspended = NO;
-        [inset apply];
-      }];
-      // A cancelled transition posts neither DidEnter nor DidExit, and the window stays
-      // unhooked until the next apply, so resume from the failure notification as well.
-      layout.didFailEnterFullScreenObserver = [center addObserverForName:NSWindowDidFailToEnterFullScreenNotification object:window queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* note) {
         inset.suspended = NO;
         [inset apply];
       }];
