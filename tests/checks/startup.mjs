@@ -5,13 +5,15 @@ import { setImmediate } from 'node:timers/promises'
 import vm from 'node:vm'
 import { createRuntime } from '../fixtures/runtime-modules.mjs'
 
-for (const alreadyReady of [false, true]) {
-  let isReady = alreadyReady, resolveReady, screenReads = 0
+async function run(alreadyReady, platform) {
+  const fixtureName = platform === 'linux' ? 'Startup Fixture Nightly' : 'Startup Fixture'
+  let isReady = alreadyReady, resolveReady, screenReads = 0, appName = ''
   const readiness = new Promise(resolve => { resolveReady = resolve })
   if (alreadyReady) resolveReady()
   const order = [], messages = []
   const initialized = name => { assert.ok(isReady, `${name} before app readiness`); order.push(name) }
   const expected = ['app-id', 'menu', 'completed', 'error', 'navigation', 'download', 'permission']
+  if (platform === 'linux') expected.unshift('desktop-name')
   const display = {
     label: 'Startup display', scaleFactor: 2,
     bounds: { x: 0, y: 0, width: 800, height: 600 },
@@ -34,6 +36,13 @@ for (const alreadyReady of [false, true]) {
   const electron = {
     app: Object.assign(new EventEmitter(), {
       whenReady: () => readiness,
+      setName: name => { appName = name },
+      getName: () => appName,
+      setDesktopName: name => {
+        assert.equal(name, `${fixtureName}.desktop`, 'desktop name must be the app name plus the .desktop suffix')
+        assert.ok(!isReady, 'desktop name must be set before app readiness')
+        order.push('desktop-name')
+      },
       setAppUserModelId: id => { assert.equal(id, 'startup.regression'); initialized('app-id') },
       quit: () => assert.fail('startup unexpectedly quit'),
     }),
@@ -46,7 +55,12 @@ for (const alreadyReady of [false, true]) {
   }
   const context = vm.createContext({
     console,
-    process: { argv: ['node', 'main.cjs', '--port', '1', '--tauri-identifier', 'startup.regression'], env: {}, platform: 'darwin', versions: { electron: 'startup-fixture' } },
+    process: {
+      argv: ['node', 'main.cjs', '--port', '1', '--tauri-identifier', 'startup.regression'],
+      env: platform === 'linux' ? { ELECTRON_RS_APP_NAME: fixtureName } : {},
+      platform,
+      versions: { electron: 'startup-fixture' },
+    },
   })
   const runtime = createRuntime(context, electron, { send(message) {
     if (message.event === 'ready') {
@@ -55,6 +69,7 @@ for (const alreadyReady of [false, true]) {
     }
     messages.push(structuredClone(message))
   } })
+  if (platform === 'linux') assert.equal(electron.app.getName(), fixtureName, 'app name must come from the injected environment')
   if (alreadyReady) await setImmediate()
   else assert.throws(() => electron.screen.getAllDisplays(), /before the app 'ready' event/)
 
@@ -62,7 +77,7 @@ for (const alreadyReady of [false, true]) {
   await setImmediate()
   if (!alreadyReady) {
     assert.deepEqual(messages, [], 'socket connect must not advertise readiness early')
-    assert.deepEqual(order, [], 'initialization must wait for app readiness')
+    assert.deepEqual(order, platform === 'linux' ? ['desktop-name'] : [], 'initialization must wait for app readiness')
     isReady = true
     resolveReady()
     await setImmediate()
@@ -82,4 +97,6 @@ for (const alreadyReady of [false, true]) {
   await setImmediate()
   assert.equal(messages.filter(message => message.event === 'ready').length, 1, 'exactly one authenticated handshake')
 }
-console.log('startup: PASS (generated main, delayed/already-ready app, initialization before authenticated handshake, screen RPC)')
+for (const alreadyReady of [false, true]) await run(alreadyReady, 'darwin')
+await run(false, 'linux')
+console.log('startup: PASS (generated main, delayed/already-ready app, initialization before authenticated handshake, screen RPC, linux desktop name)')

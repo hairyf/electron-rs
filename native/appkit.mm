@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #include <pthread.h>
+#include <dispatch/dispatch.h>
 #include <stdint.h>
 #include <string.h>
 #include <cmath>
@@ -9,9 +10,16 @@
 // Retain the inset with the owning window; notifications never retain the window.
 @interface DSHWindowButtonInset : NSObject
 @property(nonatomic, weak) NSWindow* window;
+@property(nonatomic, weak) NSView* container;
 @property(nonatomic) NSPoint inset;
 @property(nonatomic) BOOL applying;
+@property(nonatomic) BOOL suspended;
+@property(nonatomic, assign) Class originalContainerClass;
+@property(nonatomic, strong) id willEnterFullScreenObserver;
+@property(nonatomic, strong) id willExitFullScreenObserver;
+@property(nonatomic, strong) id didExitFullScreenObserver;
 - (void)apply;
+- (void)unhook;
 @end
 
 static char buttonInsetKey;
@@ -52,8 +60,15 @@ static Class dsh_inset_subclass(Class base) {
   NSButton* mini = [window standardWindowButton:NSWindowMiniaturizeButton];
   NSButton* zoom = [window standardWindowButton:NSWindowZoomButton];
   NSView* container = close.superview.superview;
-  if (window.styleMask & NSWindowStyleMaskFullScreen || !close || !mini || !zoom || !container) return;
-  Class hooked = dsh_inset_subclass(object_getClass(container));
+  if (window.styleMask & NSWindowStyleMaskFullScreen || self.suspended || !close || !mini || !zoom || !container) return;
+  // AppKit resolves the view class by identity inside its own layout passes, so the
+  // class it replaced has to be remembered to be able to hand the view back (issue #1461).
+  Class current = object_getClass(container);
+  if (strncmp(class_getName(current), "DSHInset", 8) != 0) {
+    self.originalContainerClass = current;
+    self.container = container;
+  }
+  Class hooked = dsh_inset_subclass(current);
   if (hooked && object_getClass(container) != hooked) object_setClass(container, hooked);
   self.applying = YES;
   NSRect frame = container.frame;
@@ -70,6 +85,25 @@ static Class dsh_inset_subclass(Class base) {
     if (!NSEqualPoints(buttons[i].frame.origin, origin)) [buttons[i] setFrameOrigin:origin];
   }
   self.applying = NO;
+}
+
+// NSTitlebarView sorts its subviews while a fullscreen transition rebuilds the window
+// frame, and a swapped view class there reads freed memory (issue #1461). The class pair
+// declares no ivars, so restoring the original class keeps the instance layout valid.
+- (void)unhook {
+  NSView* container = self.container;
+  if (!container || !self.originalContainerClass) return;
+  self.suspended = YES;
+  if (strncmp(class_getName(object_getClass(container)), "DSHInset", 8) == 0) {
+    object_setClass(container, self.originalContainerClass);
+  }
+}
+
+- (void)dealloc {
+  NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+  if (self.willEnterFullScreenObserver) [center removeObserver:self.willEnterFullScreenObserver];
+  if (self.willExitFullScreenObserver) [center removeObserver:self.willExitFullScreenObserver];
+  if (self.didExitFullScreenObserver) [center removeObserver:self.didExitFullScreenObserver];
 }
 @end
 
@@ -230,6 +264,33 @@ napi_value set_traffic_light_position(napi_env env, napi_callback_info info) {
       layout = [DSHWindowButtonInset new];
       layout.window = window;
       objc_setAssociatedObject(window, &buttonInsetKey, layout, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+      // One registration per window: the inset lives in the window's associated object,
+      // so the observers go with it instead of accumulating across fullscreen toggles.
+      // The will-notifications run synchronously on their posting thread because AppKit
+      // lays the titlebar out before the next run loop turn; re-applying waits for the
+      // transition to finish instead of writing frames while AppKit animates them.
+      NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+      __weak DSHWindowButtonInset* inset = layout;
+      layout.willEnterFullScreenObserver = [center addObserverForName:NSWindowWillEnterFullScreenNotification object:window queue:nil usingBlock:^(NSNotification* note) {
+        [inset unhook];
+        // A cancelled transition posts no notification at all (AppKit only offers the
+        // NSWindowDelegate callback for it), so re-check once the animation is over: the
+        // window is either fullscreen, where apply is a no-op, or back to a windowed
+        // layout the inset has to restore.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+          NSWindow* target = inset.window;
+          if (!target || (target.styleMask & NSWindowStyleMaskFullScreen)) return;
+          inset.suspended = NO;
+          [inset apply];
+        });
+      }];
+      layout.willExitFullScreenObserver = [center addObserverForName:NSWindowWillExitFullScreenNotification object:window queue:nil usingBlock:^(NSNotification* note) {
+        [inset unhook];
+      }];
+      layout.didExitFullScreenObserver = [center addObserverForName:NSWindowDidExitFullScreenNotification object:window queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* note) {
+        inset.suspended = NO;
+        [inset apply];
+      }];
     }
     layout.inset = NSMakePoint(x, y);
     [layout apply];

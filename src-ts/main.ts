@@ -61,6 +61,9 @@ const schemes = (arg('--tauri-schemes') ?? '')
 // 必须在 app ready 之前注册，否则首次导航会被当成外部 URL。
 Protocols.registerPrivileged(schemes)
 
+// GNOME 按 app_id 匹配同名的 .desktop 文件，且该值只在 ready 前生效。
+if (process.platform === 'linux') app.setDesktopName(`${app.getName()}.desktop`)
+
 // ── 运行期注册表 ───────────────────────────────────────────────────────────
 // 生命周期与进程一致。取代 main.cjs 里散在 state 上的多张 Map / WeakMap。
 const windows = new Windows()
