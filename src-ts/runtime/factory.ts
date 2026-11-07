@@ -18,6 +18,7 @@ export interface WindowFactory {
   acquireBrowserGuest(webviewId: number, workspace: unknown): { lease: string; partition: string }
   releaseBrowserGuest(webviewId: number, lease: unknown): Promise<void>
   setTrustedOrigin(webviewId: number, origin: unknown): Promise<void>
+  setTrustedOriginAndNavigate(webviewId: number, origin: unknown, url: unknown): Promise<void>
 }
 
 export interface FactoryDependencies {
@@ -51,16 +52,34 @@ export class Factory implements WindowFactory {
     return this.browser.release(this.deps.webviews.get(webviewId), lease)
   }
 
-  async setTrustedOrigin(webviewId: number, value: unknown): Promise<void> {
+  private trustedOrigin(owner: Webview, value: unknown): string {
     if (typeof value !== 'string') throw new Error('invalid trusted document origin')
-    const owner = this.deps.webviews.get(webviewId)
     const origin = new URL(value)
     const normalized = documentOrigin(value)
     const initial = normalized !== 'null' && normalized === documentOrigin(owner.initialUrl)
     if ((!['http:', 'https:'].includes(origin.protocol) && !initial) || origin.username || origin.password || !['', '/'].includes(origin.pathname) || origin.search || origin.hash) throw new Error('invalid trusted document origin')
+    return normalized
+  }
+
+  async setTrustedOrigin(webviewId: number, value: unknown): Promise<void> {
+    const owner = this.deps.webviews.get(webviewId)
+    const normalized = this.trustedOrigin(owner, value)
+    if (owner.trustedNavigationPending) throw new Error('trusted navigation already pending')
     this.deps.protocols.authenticatedHosts.unbind(owner)
-    await this.browser.releaseAll(owner)
     owner.setAuthenticatedOrigin(normalized)
+    await this.browser.releaseAll(owner)
+  }
+
+  async setTrustedOriginAndNavigate(webviewId: number, value: unknown, target: unknown): Promise<void> {
+    const owner = this.deps.webviews.get(webviewId)
+    const normalized = this.trustedOrigin(owner, value)
+    if (typeof target !== 'string') throw new Error('invalid trusted navigation URL')
+    const url = new URL(target)
+    if (url.username || url.password || documentOrigin(url.href) !== normalized) throw new Error('invalid trusted navigation URL')
+    await owner.navigateWithTrustedOrigin(url.href, () => this.browser.releaseAll(owner), () => {
+      this.deps.protocols.authenticatedHosts.unbind(owner)
+      owner.setAuthenticatedOrigin(normalized)
+    })
   }
 
   createWindow(params: Params): { windowId: number } {

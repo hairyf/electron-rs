@@ -39,6 +39,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
   private documentReady = false
   private retainedDocumentReady = false
   private generation = 0
+  private pendingTrustedNavigation?: { url: string }
   get documentGeneration(): number { return this.generation }
   private contextMenu?: Menu
   private settleTimer?: ReturnType<typeof setTimeout>
@@ -97,6 +98,53 @@ export class Webview extends EventEmitter<WebviewEvents> {
   get browserHost(): boolean { return this.config.browserHost === true }
   get trustedOrigin(): string { return this.authenticatedOrigin ?? documentOrigin(this.initialUrl) }
   setAuthenticatedOrigin(origin: string): void { this.authenticatedOrigin = origin }
+  acceptsNavigation(url: string): boolean {
+    return this.pendingTrustedNavigation !== undefined ? url === this.pendingTrustedNavigation.url : this.acceptsIpc(url)
+  }
+  get trustedNavigationPending(): boolean { return this.pendingTrustedNavigation !== undefined }
+  navigateWithTrustedOrigin(url: string, prepare: () => Promise<void>, commit: () => void): Promise<void> {
+    if (this.pendingTrustedNavigation !== undefined) return Promise.reject(new Error('trusted navigation already pending'))
+    const contents = this.contents
+    if (contents.isDestroyed()) return Promise.reject(new Error('trusted navigation owner destroyed'))
+    const current = new URL(contents.getURL())
+    const target = new URL(url)
+    current.hash = ''; target.hash = ''
+    if (current.href === target.href) return Promise.reject(new Error('trusted navigation requires a different document'))
+    const pending = { url }
+    this.pendingTrustedNavigation = pending
+    return new Promise<void>((resolve, reject) => {
+      let settled = false
+      const finish = (error?: Error) => {
+        if (settled) return
+        settled = true
+        if (this.pendingTrustedNavigation === pending) this.pendingTrustedNavigation = undefined
+        contents.removeListener('did-frame-navigate', committed)
+        contents.removeListener('will-redirect', redirect)
+        contents.removeListener('will-navigate', navigate)
+        contents.removeListener('did-stop-loading', stopped)
+        contents.removeListener('destroyed', destroyed)
+        if (error) reject(error)
+        else resolve()
+      }
+      const committed = (_event: unknown, target: string, _code: number, _status: string, main: boolean) => {
+        if (!main) return
+        if (target !== url) { finish(new Error('trusted navigation committed another document')); return }
+        try { commit(); finish() } catch (error) { finish(error instanceof Error ? error : new Error(String(error))) }
+      }
+      const redirect = (event: Event, target: string, _inPlace: boolean, main: boolean) => { if (main && target !== url) { event.preventDefault(); contents.stop() } }
+      const navigate = (event: Event, target: string) => { if (target !== url) event.preventDefault() }
+      const stopped = () => finish(new Error('trusted navigation stopped before commit'))
+      const destroyed = () => finish(new Error('trusted navigation owner destroyed'))
+      contents.prependListener('did-frame-navigate', committed)
+      contents.on('will-redirect', redirect)
+      contents.on('will-navigate', navigate)
+      contents.once('did-stop-loading', stopped)
+      contents.once('destroyed', destroyed)
+      void prepare().then(() => {
+        if (this.pendingTrustedNavigation === pending) return contents.loadURL(url)
+      }).catch(error => { if (this.pendingTrustedNavigation === pending) finish(error instanceof Error ? error : new Error(String(error))) })
+    })
+  }
   acceptsIpc(url: string): boolean {
     const origin = this.authenticatedOrigin ?? (this.browserHost ? this.trustedOrigin : this.config.ipcOrigin)
     if (typeof origin !== 'string') return true

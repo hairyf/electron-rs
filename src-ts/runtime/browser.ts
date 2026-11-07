@@ -21,6 +21,7 @@ export class BrowserGuests {
 
   acquire(owner: Webview, workspace: unknown): { lease: string; partition: string } {
     this.owner(owner)
+    if (owner.trustedNavigationPending) throw new Error('browser guest: trusted navigation pending')
     if (typeof workspace !== 'string' || !workspace.length || workspace.length > 4096) throw new Error('browser guest: invalid workspace')
     let partition = this.partitions.get(workspace)
     if (!partition) {
@@ -103,7 +104,7 @@ export class BrowserGuests {
     contents.on('will-attach-webview', (event, preferences, params) => {
       const id = typeof params.src === 'string' && params.src.startsWith('about:blank#') ? params.src.slice(12) : ''
       const lease = this.leases.get(id)
-      if (!lease || lease.owner !== owner || lease.frame !== contents.mainFrame || lease.attached || params.partition !== lease.partition || documentOrigin(contents.getURL()) !== owner.trustedOrigin) { event.preventDefault(); return }
+      if (owner.trustedNavigationPending || !lease || lease.owner !== owner || lease.frame !== contents.mainFrame || lease.attached || params.partition !== lease.partition || documentOrigin(contents.getURL()) !== owner.trustedOrigin) { event.preventDefault(); return }
       const instanceId: unknown = params.instanceId
       if (typeof instanceId !== 'number' || !Number.isSafeInteger(instanceId) || attachments.has(instanceId)) { event.preventDefault(); return }
       attachments.set(instanceId, id)
@@ -122,7 +123,7 @@ export class BrowserGuests {
       const attachedId = instanceId === undefined ? undefined : attachments.get(instanceId)
       if (instanceId !== undefined) attachments.delete(instanceId)
       const attached = attachedId === undefined ? undefined : this.leases.get(attachedId)
-      if (!attachedId || !attached || attached.owner !== owner || attached.guest || attached.frame !== contents.mainFrame || guest.session !== session.fromPartition(attached.partition)) { guest.close({ waitForBeforeUnload: false }); return }
+      if (owner.trustedNavigationPending || !attachedId || !attached || attached.owner !== owner || attached.guest || attached.frame !== contents.mainFrame || guest.session !== session.fromPartition(attached.partition)) { guest.close({ waitForBeforeUnload: false }); return }
       attached.guest = guest
       guest.once('destroyed', () => { this.leases.delete(attachedId) })
       guest.once('render-process-gone', () => { void this.close(attachedId).catch(error => console.error('browser guest cleanup failed', error)) })
