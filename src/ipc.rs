@@ -74,6 +74,7 @@ type PendingSender = (String, Option<String>, oneshot::Sender<RpcResult>);
 
 struct Subscribers {
   initial: Option<SyncSender<Event>>,
+  initial_overflowed: bool,
   future: Vec<SyncSender<Event>>,
 }
 
@@ -282,6 +283,7 @@ impl Electron {
       events: Mutex::new(Some(event_rx)),
       subscribers: Mutex::new(Subscribers {
         initial: Some(event_tx),
+        initial_overflowed: false,
         future: Vec::new(),
       }),
       next_id: AtomicU64::new(0),
@@ -299,7 +301,8 @@ impl Electron {
   /// Take the initial event receiver once, including events buffered since launch.
   ///
   /// At most 1,024 events are buffered, even before this receiver is taken. An
-  /// event arriving while full shuts Electron down to make protocol loss visible.
+  /// event arriving while full is dropped with a warning: this receiver feeds the
+  /// runtime's run loop, so closing the channel here would end the application.
   /// Drain buffered events and handle channel disconnection: `ipc.closed` is a
   /// best-effort final notification and cannot be queued when the buffer is full.
   pub fn events(&self) -> Result<Receiver<Event>, Error> {
@@ -576,16 +579,16 @@ impl Electron {
     if self.closed.load(Ordering::SeqCst) {
       return;
     }
+    let mut initial_dropped = false;
     if let Some(initial) = &subscribers.initial {
       match initial.try_send(event.clone()) {
-        Ok(()) => {}
+        Ok(()) => subscribers.initial_overflowed = false,
         Err(TrySendError::Disconnected(_)) => subscribers.initial = None,
         Err(TrySendError::Full(_)) => {
-          // Shutdown takes this lock again; release it before closing IPC.
-          drop(subscribers);
-          self.shutdown();
-          eprintln!("[electron] initial event queue exceeded {EVENT_CAPACITY} events; closed IPC");
-          return;
+          // This receiver drives the runtime's run loop, so closing it would end the
+          // application: drop the event and keep the channel open instead.
+          initial_dropped = !subscribers.initial_overflowed;
+          subscribers.initial_overflowed = true;
         }
       }
     }
@@ -601,8 +604,13 @@ impl Electron {
         }
       });
     drop(subscribers);
+    if initial_dropped {
+      log::warn!(
+        "[electron] initial event queue exceeded {EVENT_CAPACITY} events; dropped the event"
+      );
+    }
     if overflowed > 0 {
-      eprintln!(
+      log::warn!(
         "[electron] closed {overflowed} event subscriptions exceeding {EVENT_CAPACITY} queued events"
       );
     }
@@ -943,6 +951,7 @@ mod tests {
       events: Mutex::new(Some(receiver)),
       subscribers: Mutex::new(Subscribers {
         initial: Some(sender),
+        initial_overflowed: false,
         future: Vec::new(),
       }),
       next_id: AtomicU64::new(0),
@@ -1368,34 +1377,48 @@ mod tests {
   }
 
   #[test]
-  fn unclaimed_initial_queue_overflow_closes_ipc_and_wakes_rpc() {
+  fn unclaimed_initial_queue_overflow_drops_the_event_and_keeps_ipc_open() {
     let (electron, peer, reader) = loopback(READY);
     electron.start_reader(reader).unwrap();
     let peer = std::thread::spawn(move || {
       let mut reader = BufReader::new(peer);
       let mut line = String::new();
       assert!(reader.read_line(&mut line).unwrap() > 0);
+      let request: Value = serde_json::from_str(&line).unwrap();
       let mut burst = Vec::new();
       for index in 0..=EVENT_CAPACITY {
         writeln!(&mut burst, "{}", json!({"event":"queued","index":index})).unwrap();
       }
+      writeln!(
+        &mut burst,
+        "{}",
+        json!({"id":request["id"],"result":"alive"})
+      )
+      .unwrap();
       reader.get_mut().write_all(&burst).unwrap();
-      line.clear();
-      assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+      reader
     });
-    let error = call(&electron, "overflow", Value::Null, WAIT, false).unwrap_err();
-    assert!(matches!(error, Error::ChannelDisconnected), "{error}");
-    peer.join().unwrap();
-    assert!(electron.closed.load(Ordering::SeqCst));
+    assert_eq!(call(&electron, "overflow", Value::Null, WAIT, false).unwrap(), "alive");
+    assert!(!electron.closed.load(Ordering::SeqCst));
     assert!(electron.pending.lock().unwrap().is_empty());
     let events = electron.events().unwrap();
     for index in 0..EVENT_CAPACITY {
       assert_eq!(events.recv_timeout(WAIT).unwrap()["index"], index);
     }
-    assert!(matches!(
-      events.recv_timeout(WAIT),
-      Err(RecvTimeoutError::Disconnected)
-    ));
+    assert!(
+      events.try_recv().is_err(),
+      "the overflowing event is dropped, not queued"
+    );
+    assert!(
+      !matches!(
+        events.recv_timeout(Duration::from_millis(50)),
+        Err(RecvTimeoutError::Disconnected)
+      ),
+      "the initial subscription must stay open"
+    );
+    drop(events);
+    drop(peer.join().unwrap());
+    electron.shutdown();
   }
 
   #[test]
