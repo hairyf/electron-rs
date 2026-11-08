@@ -337,9 +337,95 @@ pub(crate) fn unique_sibling(path: &Path, kind: &str) -> PathBuf {
   path.with_file_name(format!(".{}-{kind}-{}-{serial}", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id()))
 }
 
+/// 临时目录放在 output 的祖父目录：同一文件系统可原子 rename，
+/// 又不在 bundler 递归扫描的资源根（output 的父目录）之内。
+pub(crate) fn temporary_sibling(output: &Path, kind: &str) -> PathBuf {
+  let parent = output.parent().unwrap_or(output);
+  let root = parent.parent().unwrap_or(parent);
+  unique_sibling(&root.join(output.file_name().unwrap_or_default()), kind)
+}
+
+/// 建立空的临时目录；祖父目录可能尚未存在（首次构建）。
+pub(crate) fn stage_directory(output: &Path, kind: &str) -> Result<PathBuf, Error> {
+  let stage = temporary_sibling(output, kind);
+  if let Some(parent) = stage.parent() {
+    fs::create_dir_all(parent).map_err(|error| Error::with_source(format!("create {}", parent.display()), error))?;
+  }
+  fs::create_dir(&stage).map_err(|error| Error::with_source(format!("create {}", stage.display()), error))?;
+  Ok(stage)
+}
+
+/// 清掉旧版本把临时目录放在扫描根里留下的残留：bundler 会把它们当资源打包。
+pub(crate) fn remove_legacy_temporaries(output: &Path) {
+  let (Some(parent), Some(name)) = (output.parent(), output.file_name()) else { return };
+  let prefix = format!(".{}-", name.to_string_lossy());
+  let Ok(entries) = fs::read_dir(parent) else { return };
+  for entry in entries.flatten() {
+    let Ok(kind) = entry.file_type() else { continue };
+    if kind.is_dir() && entry.file_name().to_string_lossy().starts_with(&prefix) {
+      let _ = remove_tree(&entry.path());
+    }
+  }
+}
+
+/// 删除子树：先放开写权限，再对并发写入/权限残留造成的失败退避重试。
+pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
+  let missing = |error: &io::Error| error.kind() == io::ErrorKind::NotFound;
+  match fs::symlink_metadata(path) {
+    Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => (),
+    Ok(_) => return fs::remove_file(path),
+    Err(error) if missing(&error) => return Ok(()),
+    Err(error) => return Err(error),
+  }
+  let mut last = None;
+  for attempt in 0..5_u32 {
+    if attempt > 0 { std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt))); }
+    make_writable(path);
+    match fs::remove_dir_all(path) {
+      Ok(()) => return Ok(()),
+      Err(error) if missing(&error) => return Ok(()),
+      Err(error) => {
+        let retry = matches!(error.kind(), io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::PermissionDenied);
+        last = Some(error);
+        if !retry { break; }
+      }
+    }
+  }
+  Err(last.unwrap_or_else(|| io::Error::other("remove directory failed")))
+}
+
+#[cfg(unix)]
+fn make_writable(path: &Path) {
+  use std::os::unix::fs::PermissionsExt;
+  let Ok(meta) = fs::symlink_metadata(path) else { return };
+  if meta.file_type().is_symlink() { return; }
+  let mode = meta.permissions().mode();
+  if meta.is_dir() {
+    if mode & 0o700 != 0o700 { let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700)); }
+    if let Ok(entries) = fs::read_dir(path) { for entry in entries.flatten() { make_writable(&entry.path()); } }
+  } else if mode & 0o600 != 0o600 {
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o600));
+  }
+}
+
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn make_writable(path: &Path) {
+  let Ok(meta) = fs::symlink_metadata(path) else { return };
+  if meta.file_type().is_symlink() { return; }
+  if meta.permissions().readonly() {
+    let mut permissions = meta.permissions();
+    permissions.set_readonly(false);
+    let _ = fs::set_permissions(path, permissions);
+  }
+  if meta.is_dir() {
+    if let Ok(entries) = fs::read_dir(path) { for entry in entries.flatten() { make_writable(&entry.path()); } }
+  }
+}
+
 /// Renaming stage to output commits publication. Later cleanup is diagnostic.
 pub(crate) fn replace_directory(stage: &Path, output: &Path) -> Result<Option<Error>, Error> {
-  replace_directory_with(stage, output, &mut |from, to| fs::rename(from, to), &mut |path| fs::remove_dir_all(path))
+  replace_directory_with(stage, output, &mut |from, to| fs::rename(from, to), &mut remove_tree)
 }
 
 #[derive(Debug)]
@@ -373,7 +459,7 @@ fn replace_directory_with(
     rename(stage, output).map_err(|error| Error::with_source(format!("publish {}", output.display()), error))?;
     return Ok(None);
   }
-  let backup = unique_sibling(output, "previous");
+  let backup = temporary_sibling(output, "previous");
   rename(output, &backup).map_err(|error| Error::with_source(format!("back up {} to {}", output.display(), backup.display()), error))?;
   if let Err(error) = rename(stage, output) {
     if let Err(rollback) = rename(&backup, output) {
@@ -511,8 +597,7 @@ pub(crate) fn download(version: &str, target: &DistributionTarget) -> Result<Pat
 
   let parent = dist.parent().ok_or("cache path has no parent")?;
   fs::create_dir_all(parent).map_err(|error| Error::with_source(format!("create {}", parent.display()), error))?;
-  let stage = unique_sibling(&dist, "unpack");
-  fs::create_dir(&stage).map_err(|error| Error::with_source(format!("create {}", stage.display()), error))?;
+  let stage = stage_directory(&dist, "unpack")?;
   let result = (|| {
     unpack(&archive, &stage).map_err(|error| error.context(format!("unpack {name}")))?;
     target.verify_binary(&stage.join(target.executable()))?;
@@ -521,7 +606,7 @@ pub(crate) fn download(version: &str, target: &DistributionTarget) -> Result<Pat
     }
     // A published distribution is never moved aside: another build may be reading it.
     if verified_dist(&dist, version, target).is_some() {
-      let _ = fs::remove_dir_all(&stage);
+      let _ = remove_tree(&stage);
       return Ok(dist);
     }
     match replace_directory(&stage, &dist) {
@@ -534,7 +619,7 @@ pub(crate) fn download(version: &str, target: &DistributionTarget) -> Result<Pat
     }
     Ok(dist)
   })();
-  if result.is_err() { let _ = fs::remove_dir_all(&stage); }
+  if result.is_err() { let _ = remove_tree(&stage); }
   result
 }
 
@@ -900,6 +985,133 @@ mod tests {
     let error = resolve_output(None, &target("x86_64-unknown-linux-gnu"), None, None, &|| Ok(root.clone())).unwrap_err();
     assert!(error.to_string().contains("cargo metadata"));
     assert!(error.to_string().contains("failed"));
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn temporary_directories_avoid_the_directory_that_bundlers_scan() {
+    let root = temporary("temp-outside");
+    let scan = root.join("target/electron");
+    let output = scan.join("linux-x64");
+    fs::create_dir_all(&output).unwrap();
+    let stage = stage_directory(&output, "stage").unwrap();
+    let backup = temporary_sibling(&output, "previous");
+    for path in [&stage, &backup] {
+      assert_eq!(path.parent().unwrap(), root.join("target"), "{}", path.display());
+      assert!(!path.starts_with(&scan));
+    }
+    assert!(stage.is_dir());
+    let entries = fs::read_dir(&scan).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>();
+    assert_eq!(entries, vec![output.file_name().unwrap().to_os_string()]);
+    remove_tree(&stage).unwrap();
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn a_first_build_creates_missing_ancestors_for_its_staging_directory() {
+    let root = temporary("temp-first-build");
+    let output = root.join("target/electron/linux-x64");
+    let stage = stage_directory(&output, "stage").unwrap();
+    assert!(stage.is_dir());
+    assert_eq!(stage.parent().unwrap(), root.join("target"));
+    assert!(!output.exists());
+    remove_tree(&stage).unwrap();
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn replacement_removes_the_old_distribution_without_leaving_neighbours() {
+    let root = temporary("replace-neighbours");
+    let scan = root.join("target/electron");
+    let output = scan.join("linux-x64");
+    let stage = stage_directory(&output, "stage").unwrap();
+    fs::write(stage.join("fresh"), b"new").unwrap();
+    fs::create_dir_all(&output).unwrap();
+    fs::write(output.join("stale"), b"old").unwrap();
+    assert!(replace_directory(&stage, &output).unwrap().is_none());
+    assert_eq!(fs::read(output.join("fresh")).unwrap(), b"new");
+    assert!(!output.join("stale").exists());
+    assert!(!stage.exists());
+    let entries = fs::read_dir(&scan).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>();
+    assert_eq!(entries, vec![output.file_name().unwrap().to_os_string()]);
+    let leftovers = fs::read_dir(root.join("target")).unwrap()
+      .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+      .filter(|name| name != "electron").collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn a_failed_cleanup_never_leaves_a_directory_beside_the_output() {
+    let root = temporary("cleanup-outside");
+    let scan = root.join("target/electron");
+    let output = scan.join("linux-x64");
+    let stage = stage_directory(&output, "stage").unwrap();
+    fs::write(stage.join("fresh"), b"new").unwrap();
+    fs::create_dir_all(&output).unwrap();
+    fs::write(output.join("stale"), b"old").unwrap();
+    let mut backup = None;
+    let warning = replace_directory_with(&stage, &output, &mut |from, to| fs::rename(from, to), &mut |path| {
+      backup = Some(path.to_path_buf());
+      Err(io::Error::new(io::ErrorKind::PermissionDenied, "cleanup denied"))
+    }).unwrap().unwrap();
+    let backup = backup.unwrap();
+    assert_eq!(backup.parent().unwrap(), root.join("target"));
+    assert!(!scan.join(backup.file_name().unwrap()).exists());
+    assert_eq!(fs::read(backup.join("stale")).unwrap(), b"old");
+    assert!(warning.to_string().contains(&backup.display().to_string()));
+    assert_eq!(fs::read(output.join("fresh")).unwrap(), b"new");
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn legacy_temporaries_are_swept_from_the_scan_root_only() {
+    let root = temporary("legacy-sweep");
+    let scan = root.join("target/electron");
+    let output = scan.join("darwin-arm64");
+    fs::create_dir_all(&output).unwrap();
+    let legacy = scan.join(".darwin-arm64-previous-13500-1");
+    fs::create_dir_all(legacy.join("Electron.app")).unwrap();
+    fs::write(legacy.join("Electron.app/Info.plist"), b"stale").unwrap();
+    let legacy_stage = scan.join(".darwin-arm64-stage-9-9");
+    fs::create_dir(&legacy_stage).unwrap();
+    let other = scan.join("darwin-x64");
+    fs::create_dir(&other).unwrap();
+    let unrelated = scan.join(".preparation.lock");
+    fs::write(&unrelated, b"").unwrap();
+    remove_legacy_temporaries(&output);
+    assert!(!legacy.exists());
+    assert!(!legacy_stage.exists());
+    assert!(output.is_dir());
+    assert!(other.is_dir());
+    assert!(unrelated.is_file());
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn removal_clears_read_only_payload_without_following_directory_links() {
+    let root = temporary("remove-tree");
+    let outside = root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("keep"), b"keep").unwrap();
+    let tree = root.join("tree");
+    let nested = tree.join("Electron.app/Contents/Frameworks");
+    fs::create_dir_all(&nested).unwrap();
+    let payload = nested.join("Electron Framework");
+    fs::write(&payload, b"binary").unwrap();
+    let mut permissions = fs::metadata(&payload).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&payload, permissions).unwrap();
+    let link = tree.join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    #[cfg(not(unix))]
+    fs::create_dir(&link).unwrap();
+    remove_tree(&tree).unwrap();
+    assert!(!tree.exists());
+    assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep");
+    remove_tree(&tree).unwrap();
+    assert!(remove_tree(&root.join("missing")).is_ok());
     fs::remove_dir_all(root).unwrap();
   }
 

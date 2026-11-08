@@ -117,6 +117,7 @@ impl ElectronBuilder {
     let output = acquisition::output_directory(self.output.as_deref(), &target)?;
     let parent = output.parent().ok_or("Electron output has no parent")?;
     fs::create_dir_all(parent).map_err(|error| Error::with_source(format!("create {}", parent.display()), error))?;
+    acquisition::remove_legacy_temporaries(&output);
     let canonical_output = fs::canonicalize(parent)
       .map_err(|error| Error::with_source(format!("resolve {}", parent.display()), error))?
       .join(output.file_name().ok_or("Electron output has no directory name")?);
@@ -156,8 +157,7 @@ impl ElectronBuilder {
     }
 
     // ponytail: one builder per output; use separate outputs for concurrent builds.
-    let stage = acquisition::unique_sibling(&output, "stage");
-    fs::create_dir(&stage).map_err(|error| Error::with_source(format!("create {}", stage.display()), error))?;
+    let stage = acquisition::stage_directory(&output, "stage")?;
     let result = (|| {
       acquisition::copy_dir(&source, &stage)?;
       write_assets(&stage)?;
@@ -180,8 +180,8 @@ impl ElectronBuilder {
       Ok(PreparedDistribution { directory: output, binary, cleanup_warning })
     })();
     if result.is_err() {
-      if let Err(error) = fs::remove_dir_all(&stage) {
-        if error.kind() != io::ErrorKind::NotFound { eprintln!("[electron] clean staging {}: {error}", stage.display()); }
+      if let Err(error) = acquisition::remove_tree(&stage) {
+        eprintln!("[electron] clean staging {}: {error}", stage.display());
       }
     }
     result
