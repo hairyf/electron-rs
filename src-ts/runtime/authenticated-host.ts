@@ -6,6 +6,10 @@ import type { Webview } from './webview'
 type Host = { id: string; documentUrl: string; backendOrigin: string; cookie: string }
 type Binding = { owner?: Webview; host?: Host; retiredOrigin?: string }
 
+const SESSION_KEY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const PERSISTENT_PARTITION = 'persist:electron-authenticated-'
+const EPHEMERAL_PARTITION = 'electron-authenticated-'
+
 export class AuthenticatedHosts {
   private readonly hosts = new Map<string, Host>()
   private readonly sessions = new WeakMap<Session, Binding>()
@@ -34,8 +38,9 @@ export class AuthenticatedHosts {
 
   ownsSession(target: Session): boolean { return this.sessions.has(target) }
 
-  createSession(): Session {
-    const target = session.fromPartition('electron-authenticated-' + randomUUID())
+  createSession(key?: unknown): Session {
+    if (key !== undefined && (typeof key !== 'string' || !SESSION_KEY.test(key))) throw new Error('invalid authenticated session key')
+    const target = session.fromPartition(key === undefined ? EPHEMERAL_PARTITION + randomUUID() : PERSISTENT_PARTITION + key)
     const binding: Binding = {}
     this.sessions.set(target, binding)
     target.webRequest.onBeforeSendHeaders((details, callback) => {
