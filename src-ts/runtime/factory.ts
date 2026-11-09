@@ -196,7 +196,9 @@ export class Factory implements WindowFactory {
   private sessionFor(params?: Params | null): Session | undefined {
     if (!params) return undefined
     let target: Session | undefined
-    if (params.authenticatedWebHostSession) target = this.deps.protocols.authenticatedHosts.createSession()
+    const authenticatedSession = params.authenticatedWebHostSession
+    if (typeof authenticatedSession === 'string') target = this.deps.protocols.authenticatedHosts.createSession(authenticatedSession)
+    else if (authenticatedSession) target = this.deps.protocols.authenticatedHosts.createSession()
     else if (params.incognito) target = session.fromPartition(`tauri-private-${++Factory.nextPrivateSession}`)
     else if (params.dataDirectory) target = session.fromPath(path.resolve(params.dataDirectory))
     if (target && !this.customSessions.has(target)) {

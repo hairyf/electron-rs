@@ -30,10 +30,10 @@ server.listen(0, '127.0.0.1')
 await once(server, 'listening')
 const origin = 'http://127.0.0.1:' + server.address().port
 const sessions = []
-function newSession() {
+function newSession(partition) {
   const handlers = new Map()
   const target = Object.assign(new EventEmitter(), {
-    handlers, protocol: { handle: (scheme, handler) => handlers.set(scheme, handler) },
+    handlers, partition, protocol: { handle: (scheme, handler) => handlers.set(scheme, handler) },
     webRequest: { onBeforeSendHeaders(handler) { target.beforeHeaders = handler } },
     fetch: async (request, options) => { assert.equal(options.bypassCustomProtocolHandlers, true); return new Response('ordinary') },
   })
@@ -54,7 +54,16 @@ try {
   assert.equal(JSON.stringify(host).includes('private'), false)
   assert.equal(hosts.cookieHeader(host.id), 'auth=private')
   assert.throws(() => hosts.cookieHeader('unregistered'), /unknown authenticated host/)
-  const target = hosts.createSession()
+  const memory = hosts.createSession()
+  assert.match(memory.partition, /^electron-authenticated-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.notEqual(hosts.createSession().partition, memory.partition)
+  const target = hosts.createSession('profile-desktop-main')
+  assert.equal(target.partition, 'persist:electron-authenticated-profile-desktop-main')
+  assert.equal(hosts.createSession('profile-desktop-main').partition, target.partition)
+  assert.notEqual(hosts.createSession('profile-desktop-window-1').partition, target.partition)
+  for (const invalid of ['', ' leading', 'a:b', 'a/b', 'a b', 'é', '.', 'a'.repeat(129), 42, null, {}]) {
+    assert.throws(() => hosts.createSession(invalid), /invalid authenticated session key/)
+  }
   protocols.prepare(target)
   const owner = Object.assign(new EventEmitter(), {
     id: 51, contentsId: 8, contents: { id: 8, session: target },

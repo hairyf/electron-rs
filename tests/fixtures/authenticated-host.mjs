@@ -11,6 +11,8 @@ import { createHash } from 'node:crypto'
 const home = process.env.AUTHENTICATED_HOST_HOME
 assert.ok(home, 'native fixture requires an isolated userData directory')
 app.setPath('userData', home)
+const phase = process.env.AUTHENTICATED_HOST_PHASE ?? 'write'
+const requestedPort = Number(process.env.AUTHENTICATED_HOST_PORT ?? 0)
 const received = []
 let streamClosed = Promise.withResolvers()
 let slowRequest = Promise.withResolvers()
@@ -42,8 +44,9 @@ async function run() {
 try {
   await app.whenReady()
   console.error("native: ready")
-  server.listen(0, '127.0.0.1'); await once(server, 'listening')
+  server.listen(requestedPort, '127.0.0.1'); await once(server, 'listening')
   const origin = 'http://127.0.0.1:' + server.address().port
+  console.error('native: origin ' + origin)
   const bootstrap = createServer((_request, response) => response.end('<!doctype html><body>bootstrap</body>'))
   bootstrap.listen(0, '127.0.0.1'); await once(bootstrap, 'listening')
   const bootstrapUrl = 'http://127.0.0.1:' + bootstrap.address().port
@@ -62,7 +65,7 @@ try {
   for (const opaque of ['about:blank', 'file:///tmp/page', 'data:text/html,page', 'unknown://localhost/']) assert.equal(documentOrigin(opaque), 'null')
   const factory = new Factory({ windows, webviews, policies, protocols, transport, environment: new Environment(webviews), popups: new Map() })
   const commands = createCommands({ webviews, protocols, factory })
-  factory.createWindow({ windowId: 1, window: { visible: false }, webview: { webviewId: 2, url: 'tauri://localhost/', browserHost: true, authenticatedWebHostSession: true } })
+  factory.createWindow({ windowId: 1, window: { visible: false }, webview: { webviewId: 2, url: 'tauri://localhost/', browserHost: true, authenticatedWebHostSession: 'persistence-fixture' } })
   const owner = webviews.get(2)
   await once(owner.contents, 'did-finish-load')
   console.error('native: bootstrap')
@@ -73,6 +76,16 @@ try {
   console.error("native: document")
   assert.equal(received.at(-1).cookie, 'auth=private')
   assert.equal((await owner.contents.session.cookies.get({ url: origin })).length, 0)
+  assert.equal(owner.contents.session.isPersistent(), true)
+  assert.ok(owner.contents.session.storagePath, 'persistent authenticated sessions expose a storage path')
+  const persisted = await owner.contents.executeJavaScript('localStorage.getItem("dsh-authenticated-persist")')
+  if (phase === 'read') {
+    assert.equal(persisted, 'survives-restart')
+  } else {
+    assert.equal(persisted, null)
+    await owner.contents.executeJavaScript('localStorage.setItem("dsh-authenticated-persist", "survives-restart")')
+    owner.contents.session.flushStorageData()
+  }
   let vetoEvaluation
   owner.contents.session.webRequest.onBeforeRequest((details, callback) => {
     if (details.url !== origin + '/denied') { callback({}); return }

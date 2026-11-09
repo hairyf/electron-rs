@@ -6,7 +6,7 @@
     "build": "tsdown",
     "typecheck": "tsc -p tsconfig.electron.json",
     "test:lifecycle": "node tests/checks/lifecycle.mjs && node tests/checks/startup-authentication-native.mjs",
-    "test:browser": "node tests/fixtures/browser-guest.mjs && node tests/checks/authenticated-handoff-native.mjs",
+    "test:browser": "node tests/fixtures/browser-guest.mjs && node tests/checks/authenticated-handoff-native.mjs && node tests/checks/authenticated-host-native.mjs",
     "test:authenticated-host": "node tests/checks/authenticated-host-native.mjs",
     "test": "pnpm run test:checks && cargo test --locked",
     "test:checks": "node --experimental-vm-modules tests/checks/launcher.mjs && node tests/checks/transport.mjs && node tests/checks/authenticated-host.mjs && node tests/checks/startup.mjs && node tests/fixtures/webview-layout.mjs app-menu && node tests/checks/commands.mjs && node tests/fixtures/webview-layout.mjs native-interaction && node tests/fixtures/webview-layout.mjs minimized-constraints && node tests/fixtures/webview-layout.mjs main-dpi && node tests/fixtures/webview-layout.mjs display-scale && node tests/fixtures/webview-layout.mjs guest-webview && node tests/fixtures/webview-policy.mjs guest && node tests/fixtures/webview-policy.mjs managed-guest && node tests/fixtures/webview-policy.mjs lifecycle && node tests/fixtures/webview-policy.mjs clipboard",
