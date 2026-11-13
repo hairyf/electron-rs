@@ -115,6 +115,14 @@ class Contents extends EventEmitter {
   closeDevTools() { this.devtools = false; this.devToolsWebContents = null; this.emit('devtools-closed') }
   isDevToolsOpened() { return this.devtools ?? false }
   close() { this.destroyed = true; this.emit('destroyed') }
+  navigationHistory = {
+    entries: [], forwards: 0, cleared: 0, backs: 0, forward: 0,
+    canGoBack() { return this.entries.length > 0 },
+    canGoForward() { return this.forwards > 0 },
+    clear() { this.entries.length = 0; this.forwards = 0; this.cleared++ },
+    goBack() { this.entries.pop(); this.backs++ },
+    goForward() { this.forwards--; this.forward++ },
+  }
   constructor() { super(); allContents.push(this) }
 }
 class View {
@@ -1598,6 +1606,36 @@ switch (process.argv[2]) {
     drainTimers()
     const restored = child.getBounds()
     result = { initial, atMaximizeEvent, maximized, atRestoreEvent, restored, listeners, timers: timers.size }
+    break
+  }
+  case 'app-command': {
+    const host = await createHost(true)
+    const main = mainContentsOf(host)
+    main.navigationHistory.entries.push({ url: 'tauri://localhost/first' })
+    main.emit('did-navigate', {}, 'tauri://localhost/main', 200, 'OK')
+    const mainHistory = { canGoBack: main.navigationHistory.canGoBack(), cleared: main.navigationHistory.cleared }
+    main.navigationHistory.entries.push({ url: 'tauri://localhost/first' })
+    main.emit('did-navigate', {}, 'tauri://localhost/main', 200, 'OK')
+    const beforeBackward = { canGoBack: main.navigationHistory.canGoBack(), backs: main.navigationHistory.backs }
+    await call('webview.create', { windowId: 2, webviewId: 21, url: 'tauri://localhost/browser' })
+    const guest = host.children.at(-1).webContents
+    guest.navigationHistory.entries.push({ url: 'tauri://localhost/browser' })
+    guest.emit('did-navigate', {}, 'tauri://localhost/history', 200, 'OK')
+    const guestHistory = { canGoBack: guest.navigationHistory.canGoBack(), cleared: guest.navigationHistory.cleared }
+    host.emit('app-command', {}, 'browser-backward')
+    assert.equal(main.navigationHistory.backs, 0, 'browser-backward must never navigate the main webview')
+    const routedBackward = { mainBacks: main.navigationHistory.backs, guestBacks: guest.navigationHistory.backs }
+    guest.emit('did-navigate', {}, 'tauri://localhost/settled', 200, 'OK')
+    guest.navigationHistory.forwards = 1
+    host.emit('app-command', {}, 'browser-forward')
+    assert.equal(main.navigationHistory.forward, 0, 'browser-forward must never navigate the main webview')
+    const routedForward = guest.navigationHistory.forward
+    host.emit('app-command', {}, 'media-play-pause')
+    const unrelated = { mainBacks: main.navigationHistory.backs, guestBacks: guest.navigationHistory.backs }
+    const listeners = host.listenerCount('app-command')
+    host.destroy()
+    result = { mainHistory, beforeBackward, guestHistory, routedBackward, routedForward, unrelated,
+      listeners, afterDestroy: host.listenerCount('app-command') }
     break
   }
   case 'restore': {

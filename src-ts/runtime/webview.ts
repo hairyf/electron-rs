@@ -154,7 +154,7 @@ export class Webview extends EventEmitter<WebviewEvents> {
     const c = this.contents
     c.on('context-menu', this.onContextMenu)
     c.on('before-input-event', this.onBeforeInput)
-    c.on('did-navigate', (_e, url) => { this.retainedDocumentReady = false; this.emit('navigationCommitted', url) })
+    c.on('did-navigate', (_e, url) => { this.retainedDocumentReady = false; this.clearMainHistory(); this.emit('navigationCommitted', url) })
     c.on('did-navigate-in-page', (_e, url, isMain) => { if (isMain) this.emit('navigationCommitted', url) })
     c.on('dom-ready', () => { this.retainedDocumentReady = false; this.documentReady = true; if (this.attached) this.syncOwnerState() })
     c.on('did-stop-loading', () => { if (this.retainedDocumentReady) { this.documentReady = true; this.retainedDocumentReady = false } })
@@ -223,6 +223,11 @@ export class Webview extends EventEmitter<WebviewEvents> {
   close(): void { if (this.closed) return; this.finishClose(); if (!this.contents.isDestroyed()) this.contents.close() }
   navigate(url: string): void { void this.contents.loadURL(url).catch((error) => console.error('navigate failed', url, error)) }
   reload(): void { this.contents.reload() }
+  private clearMainHistory(): void {
+    if (!this.main || this.contents.isDestroyed()) return
+    // issue #1527：主界面是应用文档，回退会把它带离 IPC 源并整窗黑屏。
+    this.contents.navigationHistory.clear()
+  }
   goBack(): void { const h = (this.contents as NativeContents).navigationHistory; if (h?.canGoBack()) h.goBack() }
   canGoBack(): boolean { return Boolean((this.contents as NativeContents).navigationHistory?.canGoBack()) }
   goForward(): void { const h = (this.contents as NativeContents).navigationHistory; if (h?.canGoForward()) h.goForward() }
@@ -428,6 +433,16 @@ export class Webviews {
   peek(id: number): Webview | undefined { return this.byId.get(id) }
   forContents(contentsId: number): Webview | undefined { return this.byContents.get(contentsId) }
   of(window: Window): Webview[] { return [...this.byId.values()].filter((webview) => webview.window === window) }
+  // issue #1527：主界面永远不是回退目标，命令只交给同窗口里有历史的子页面；没有目标就吞掉。
+  dispatchAppCommand(window: Window, command: string): void {
+    const backward = command === 'browser-backward'
+    if (!backward && command !== 'browser-forward') return
+    const target = this.of(window).find((webview) => !webview.isMain && !webview.contents.isDestroyed()
+      && (backward ? webview.canGoBack() : webview.canGoForward()))
+    if (!target) return
+    if (backward) target.goBack()
+    else target.goForward()
+  }
   main(window: Window): Webview | undefined { return this.of(window).find((webview) => webview.isMain) }
   all(): Webview[] { return [...this.byId.values()] }
   delete(id: number): void { const webview = this.byId.get(id); if (!webview) return; this.byId.delete(id); this.byContents.delete(webview.contentsId) }

@@ -48,6 +48,7 @@ export interface WindowEnvironment extends DisplaySource {
 }
 export interface WindowEvents {
   closeRequested: []; menuCommand: [commandId: number | undefined]; themeChanged: [payload: ThemeChange]
+  appCommand: [command: string]
 }
 type NativeWindow = BaseWindow & {
   setSimpleFullScreen?(fullscreen: boolean): void
@@ -94,6 +95,7 @@ export class Window extends EventEmitter<WindowEvents> {
   private readonly scaleContents = new Set<WebContents>()
   private readonly onScaleChanged = () => this.refreshScale()
   private readonly onMetricsChanged = () => { this.refreshScale(); this.applyConstraints() }
+  private readonly onAppCommand = (_event: unknown, command: string) => { this.emit('appCommand', command) }
 
   constructor(private readonly env: WindowEnvironment, readonly native: NativeWindow, readonly id: number,
     private config: WindowConfig, private constraints: SizeConstraints) {
@@ -124,6 +126,7 @@ export class Window extends EventEmitter<WindowEvents> {
     this.native.on('enter-full-screen', this.onMetricsChanged)
     this.native.on('leave-full-screen', this.onMetricsChanged)
     this.native.on('leave-full-screen', () => this.restoreFullscreen())
+    this.native.on('app-command', this.onAppCommand)
     this.env.screen.on('display-metrics-changed', this.onMetricsChanged)
     this.applyConstraints()
     this.setSize({ width: this.config.width ?? 800, height: this.config.height ?? 600 })
@@ -175,6 +178,7 @@ export class Window extends EventEmitter<WindowEvents> {
     const emitter = this.native as unknown as NodeJS.EventEmitter
     for (const event of ['resize', 'move', 'maximize', 'unmaximize', 'restore', 'enter-full-screen', 'leave-full-screen'])
       emitter.removeListener(event, this.onMetricsChanged)
+    emitter.removeListener('app-command', this.onAppCommand)
   }
 
   get scale(): number { return this.scaleCache ?? this.displayScale() }
