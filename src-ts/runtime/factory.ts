@@ -278,6 +278,7 @@ export class Factory implements WindowFactory {
     window.on('closeRequested', () => this.deps.transport.send('window.closeRequested', { windowId: id }))
     window.on('menuCommand', (commandId) => this.deps.transport.send('menu.command', { windowId: id, commandId }))
     window.on('themeChanged', (payload) => this.deps.transport.send('window.themeChanged', { windowId: id, ...payload }))
+    window.on('appCommand', (command) => this.deps.webviews.dispatchAppCommand(window, command))
     const emit = (event: string) => { if (!window.destroyed) this.deps.transport.send('window.event', { windowId: id, event, ...window.geometry() }) }
     for (const [nativeEvent, event] of [['resize', 'resize'], ['move', 'move'], ['focus', 'focus'], ['blur', 'blur'], ['maximize', 'maximize'], ['unmaximize', 'unmaximize'], ['enter-full-screen', 'enter-full-screen'], ['leave-full-screen', 'leave-full-screen']] as const) (window.native as any).on(nativeEvent, () => emit(event))
     window.native.on('close', (event) => { if (!this.deps.transport.closed && window.requestClose()) event.preventDefault() })
