@@ -122,7 +122,8 @@ for (const [raw, expected] of [['v u 1\n', 'dark'], ['v u 2\n', 'light']]) {
   await sleep(5)
   system.set('system')
   await sleep(5)
-  assert.deepEqual(theme.writes, ['dark', 'system'], 'an unreachable portal still restores the system source')
+  assert.deepEqual(theme.writes, ['dark'], 'an unreachable portal never rewrites the active source')
+  assert.equal(theme.themeSource, 'dark', 'the active source survives an unreachable portal')
   system.dispose()
 }
 

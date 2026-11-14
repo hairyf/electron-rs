@@ -75,9 +75,16 @@ export class SystemTheme {
 
   set(preference: ThemePreference): void {
     this.preference = preference
-    if (preference !== 'system') this.write(preference)
-    else if (this.watching) this.sync()
-    else this.write('system')
+    if (preference !== 'system') {
+      this.write(preference)
+      return
+    }
+    // 用户显式选跟随系统：能读到来源就写来源；读不到时交回平台一次，由 Electron 自己
+    // 决定，之后不再插手（既不留中间闪烁，也不反复改写）。
+    if (!this.watching)
+      this.write('system')
+    else
+      this.sync()
   }
 
   dispose(): void {
@@ -102,7 +109,13 @@ export class SystemTheme {
       .then(scheme => scheme ?? this.processes.read('gsettings', SETTINGS_READ).then(settingsScheme, () => null))
       .then((scheme) => {
         this.reading = false
-        if (!this.disposed && this.preference === 'system') this.write(scheme ?? 'system')
+        // 读不到来源时保持原值：CI 与非 GNOME 桌面上 portal/gsettings 都可能是空的，
+        // 此时写 system 会把平台或测试已经设好的真实值覆盖掉。
+        // 只写真正读到的来源。读不到一律不动 themeSource：Linux 上 Electron 自己的系统
+        // 跟随本就是坏的（issue #1509 的起因），我们主动写 system 既救不回主题，还会把
+        // 别人（平台或测试）已经设好的值覆盖掉。
+        if (!this.disposed && this.preference === 'system' && scheme !== null)
+          this.write(scheme)
         if (this.rerun) {
           this.rerun = false
           this.sync()
@@ -120,6 +133,8 @@ export class SystemTheme {
     this.timer.unref()
   }
 
+  /// 写入前记住是我们自己写的值。外部（平台、测试、其它模块）改过的具体值不能被
+  /// 「跟随系统但读不到来源」覆盖成 system，否则用户看到的主题会被无依据地顶掉。
   private write(target: ThemePreference): void {
     if (this.nativeTheme.themeSource === target) return
     this.nativeTheme.themeSource = target
