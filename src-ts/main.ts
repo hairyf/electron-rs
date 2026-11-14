@@ -8,6 +8,7 @@ import { Downloads } from './runtime/downloads'
 import { Environment } from './runtime/environment'
 import { Executions } from './runtime/execution'
 import { Factory } from './runtime/factory'
+import { SystemTheme } from './runtime/native/system-theme'
 import { Policies } from './runtime/policy'
 import type { PopupPlan } from './runtime/policy'
 import { Protocols } from './runtime/protocol'
@@ -103,6 +104,11 @@ function setMenu(menu: WindowMenuItem[] | null): void {
 // Window 的原生接缝：appkit / 光标 / 主题。只有这里知道 native 适配器。
 const environment = new Environment(webviews)
 
+// Linux 上 Chromium 不跟门户的 color-scheme，只有主进程自己读、自己写主题源（issue #1509）。
+// 订阅要在 app ready 之后落地：before ready 期间不能碰任何原生资源。
+const systemTheme = new SystemTheme(nativeTheme)
+if (process.platform === 'linux') void ready.then(() => systemTheme.start())
+
 // ── 领域对象 ───────────────────────────────────────────────────────────────
 // 策略：唯一允许阻塞等 Rust 决策的地方，桥就是 transport。
 const policies = new Policies({ transport, downloads, webviews, windows, popups })
@@ -131,8 +137,8 @@ const commands = createCommands({
   policies,
   protocols,
   app,
-  nativeTheme,
   setMenu,
+  applyTheme: (preference) => systemTheme.set(preference),
   display: { screen, platform: process.platform },
   respond: (id, response) => transport.respond(id, response),
 })
@@ -177,7 +183,10 @@ transport.onClose(() => {
   for (const window of windows.all()) window.destroy()
   app.quit()
 })
-app.on('will-quit', () => { void executions.close() })
+app.on('will-quit', () => {
+  systemTheme.dispose()
+  void executions.close()
+})
 
 // 没有窗口时继续运行，直到 socket 断开。
 app.on('window-all-closed', noop)

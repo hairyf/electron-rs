@@ -1,10 +1,11 @@
 import { shell } from 'electron'
-import type { App, NativeTheme } from 'electron'
+import type { App } from 'electron'
 import type { CommandTable, Params } from '../socket/table'
 import { cursorPosition, displayAtPoint, displays } from './display'
 import type { DisplaySource } from './display'
 import type { Executions } from './execution'
 import type { WindowFactory } from './factory'
+import type { ThemePreference } from './native/system-theme'
 import type { Policies } from './policy'
 import type { Protocols } from './protocol'
 import type { CookieInit, Webview, Webviews } from './webview'
@@ -29,7 +30,7 @@ export interface CommandContext {
   readonly display: DisplaySource
   readonly app: App
   readonly setMenu: (menu: WindowMenuItem[] | null) => void
-  readonly nativeTheme: NativeTheme
+  readonly applyTheme: (preference: ThemePreference) => void
   readonly executions?: Executions
   /** 窗口与页面的创建涉及策略装配，由组合根提供。 */
   readonly factory: WindowFactory
@@ -203,7 +204,7 @@ function appCommands(ctx: CommandContext): CommandTable {
       return null
     },
     'app.theme': (p) => {
-      ctx.nativeTheme.themeSource = p.theme === 'dark' ? 'dark' : p.theme === 'light' ? 'light' : 'system'
+      ctx.applyTheme(p.theme === 'dark' ? 'dark' : p.theme === 'light' ? 'light' : 'system')
       return null
     },
     'shell.openExternal': (p) => shell.openExternal(String(p.url)).then(() => null),
