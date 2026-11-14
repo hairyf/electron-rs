@@ -188,6 +188,22 @@ async function run() {
       const closed = once(closedGuest, 'destroyed')
       factory.closeWebview(3)
       await closed
+      if (process.platform === 'darwin') {
+        factory.createWindow({ windowId: 6, window: { width: 820, height: 560, visible: false,
+          titleBarStyle: 'Overlay', hiddenTitle: true, trafficLightPosition: { x: 18, y: 24 } } })
+        const caption = windows.get(6).native
+        caption.show()
+        caption.focus()
+        caption.blur()
+        caption.focus()
+        caption.setBounds({ width: 800, height: 540 })
+        const resized = caption.getBounds()
+        assert.deepEqual([resized.width, resized.height, windows.get(6).configuration.trafficLightPosition], [800, 540, { x: 18, y: 24 }],
+          'an inset macOS window must keep its frame and inset across key-state and resize layout passes')
+        assert.equal(caption.isVisible(), true, 'the first key-window pass after the caption inset must keep the window alive')
+        console.log('macOS caption inset on first key window: PASS')
+        windows.get(6).destroy()
+      }
       windows.get(1).destroy()
       console.log('browser guest real Electron (WebContentsView host): PASS')
       clearTimeout(timer)
