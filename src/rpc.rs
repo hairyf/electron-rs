@@ -695,7 +695,8 @@ pub mod protocol {
   pub struct AuthenticatedHost { pub id: String, pub document_url: String, pub backend_origin: String }
 
   requests! {
-    AuthenticateHost { url: String } => AuthenticatedHost, "webHost.authenticate", deferred = true;
+    /// The cold-start exchange waits on the kernel's first index response; the 5s default killed it mid-render (issue #1546).
+    AuthenticateHost { url: String } => AuthenticatedHost, "webHost.authenticate", deferred = true, timeout = 60;
     HostCookieHeader { host_id: String } => String, "webHost.cookieHeader", deferred = true;
     BindHost { webview_id: u32, host_id: String } => (), "webHost.bind";
     Register { scheme: String } => (), "protocol.register";
@@ -1114,6 +1115,18 @@ mod tests {
     {
       assert_eq!(deferred, !synchronous.contains(method), "{method}");
     }
+  }
+
+  #[test]
+  fn host_authentication_outlasts_the_generic_rpc_timeout() {
+    assert_eq!(
+      protocol::AuthenticateHost { url: "http://127.0.0.1:3080/?token=t".into() }.timeout(),
+      std::time::Duration::from_secs(60)
+    );
+    assert_eq!(
+      protocol::HostCookieHeader { host_id: "id".into() }.timeout(),
+      std::time::Duration::from_secs(5)
+    );
   }
 
   #[test]
