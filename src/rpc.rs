@@ -357,6 +357,8 @@ pub mod window {
   }
 
   requests! {
+    /// Building the OS window and its first webview queues behind Electron's own startup and first paint,
+    /// so the 5s default killed legitimate cold starts with `failed to create window` (issue #1546 class).
     Create {
       window_id: u32,
       #[serde(default)] window: Config,
@@ -367,7 +369,7 @@ pub mod window {
       #[serde(skip_serializing_if = "Option::is_none")] window_icon: Option<CreationIcon>,
       #[serde(skip_serializing_if = "Option::is_none")] icon: Option<String>,
       #[serde(skip_serializing_if = "Option::is_none")] app_details: Option<AppDetails>,
-    } => Created, "window.create";
+    } => Created, "window.create", timeout = 60;
     Ready { window_id: u32 } => (), "window.ready", deferred = true;
     SetTitle { window_id: u32, title: String } => (), "window.setTitle";
     Geometry { window_id: u32 } => WindowGeometry, "window.geometry";
@@ -1133,6 +1135,8 @@ mod tests {
     .deferred());
     assert!(webview::OpenDevtools { webview_id: 1 }.timeout().as_secs() > 10);
     assert!(window::Unminimize { window_id: 1 }.timeout().as_secs() > 10);
+    let create: window::Create = serde_json::from_value(json!({"windowId": 1})).unwrap();
+    assert!(create.timeout().as_secs() > 10);
     assert!(!protocol::Register {
       scheme: "example".into()
     }
