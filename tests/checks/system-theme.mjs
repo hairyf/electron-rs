@@ -18,6 +18,7 @@ function processes(outputs) {
   return {
     reads,
     watchers,
+    outputs,
     read(command) {
       reads.push(command)
       const output = outputs[command]
@@ -49,9 +50,27 @@ for (const [raw, expected] of [['v u 1\n', 'dark'], ['v u 2\n', 'light']]) {
   system.start()
   await sleep(5)
   assert.deepEqual(theme.writes, [expected], 'portal color-scheme maps onto the native theme')
-  assert.deepEqual(bus.watchers[0].args, ['--user', 'monitor', 'org.freedesktop.portal.Desktop'])
   system.dispose()
   assert.equal(bus.watchers[0].stopped, true, 'disposing releases the portal subscription')
+}
+
+{
+  // issue #1577：带 SERVICE 位置参数时 systemd 262 会忽略 --match、按 peer 全量订阅，
+  // 与主题无关的 portal 流量全灌进主进程，空闲也要 ~2% CPU。过滤必须在 --match 上，
+  // 且不能再出现位置参数。
+  const theme = nativeTheme(), bus = processes({ busctl: 'v u 1\n' })
+  const system = new SystemTheme(theme, bus)
+  system.start()
+  await sleep(5)
+  const args = bus.watchers[0].args
+  assert.deepEqual(args, [
+    '--user',
+    '--match',
+    "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged'",
+    'monitor',
+  ], 'the portal subscription filters in the kernel instead of draining the whole peer')
+  assert.ok(!args.includes('org.freedesktop.portal.Desktop'), 'no SERVICE positional argument, or --match is ignored')
+  system.dispose()
 }
 
 {
@@ -93,6 +112,34 @@ for (const [raw, expected] of [['v u 1\n', 'dark'], ['v u 2\n', 'light']]) {
   bus.watchers[0].onData('SettingsChanged org.freedesktop.appearance color-scheme uint32 1\n')
   await sleep(5)
   assert.deepEqual(theme.writes, ['dark'], 'a repeated identical portal value must not write again')
+  system.dispose()
+}
+
+{
+  // 键名被 chunk 边界劈成两半时仍要认出这次变更，否则一次真实切换会漏掉。
+  // 读取值跟着变，才能区分「认出了信号」和「认不出」：认不出就只会保持 dark。
+  const theme = nativeTheme(), bus = processes({ busctl: 'v u 1\n' })
+  const system = new SystemTheme(theme, bus)
+  system.start()
+  await sleep(5)
+  bus.outputs.busctl = 'v u 2\n'
+  bus.watchers[0].onData('SettingsChanged org.freedesktop.appearance color-sch')
+  bus.watchers[0].onData('eme uint32 2\n')
+  await sleep(5)
+  assert.deepEqual(theme.writes, ['dark', 'light'], 'a signal split across chunks still triggers a re-read')
+  system.dispose()
+}
+
+{
+  // 无关的 portal 流量不该触发重读：那正是 issue #1577 里被灌满主线程的东西。
+  const theme = nativeTheme(), bus = processes({ busctl: 'v u 1\n' })
+  const system = new SystemTheme(theme, bus)
+  system.start()
+  await sleep(5)
+  bus.outputs.busctl = 'v u 2\n'
+  bus.watchers[0].onData('member=NameOwnerChanged path=/org/freedesktop/portal/desktop\n')
+  await sleep(5)
+  assert.deepEqual(bus.reads, ['busctl'], 'an unrelated portal signal must not trigger a re-read')
   system.dispose()
 }
 

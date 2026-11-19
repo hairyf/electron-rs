@@ -11,7 +11,11 @@ export interface ThemeProcesses {
 
 const POLL_INTERVAL_MS = 2_000
 const PORTAL_READ: string[] = ['--user', 'call', 'org.freedesktop.portal.Desktop', '/org/freedesktop/portal/desktop', 'org.freedesktop.portal.Settings', 'ReadOne', 'ss', 'org.freedesktop.appearance', 'color-scheme']
-const PORTAL_MONITOR: string[] = ['--user', 'monitor', 'org.freedesktop.portal.Desktop']
+// 只订阅 SettingChanged 信号，且不能带 SERVICE 位置参数：systemd 262 起 monitor 带位置参数时
+// 会忽略 --match、按 peer 全量订阅，于是 xdg-desktop-portal 上与主题无关的流量（KDE 下
+// ksystemstats 每 500ms 几十 KB 的传感器信号、其它应用对 portal 的调用）全被灌进主进程，
+// 空闲也要 ~2% CPU（issue #1577）。去掉位置参数后过滤在内核侧生效。
+const PORTAL_MONITOR: string[] = ['--user', '--match', `type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged'`, 'monitor']
 const PORTAL_SIGNAL = 'color-scheme'
 const SETTINGS_READ: string[] = ['get', 'org.gnome.desktop.interface', 'color-scheme']
 
@@ -67,7 +71,18 @@ export class SystemTheme {
     if (this.watching || this.disposed) return
     this.watching = true
     this.sync()
-    this.stop = this.processes.watch('busctl', PORTAL_MONITOR, (chunk) => { if (chunk.includes(PORTAL_SIGNAL)) this.sync() }, (recoverable) => {
+    // 按行判断而不是整块 includes：chunk 边界可能把一个键名劈成两半，跨块匹配会漏。
+    // 命中的那一行消费掉，未命中的残行留到下一块继续拼，避免同一条记录被反复计入。
+    let pending = ''
+    this.stop = this.processes.watch('busctl', PORTAL_MONITOR, (chunk) => {
+      pending += chunk
+      const lines = pending.split('\n')
+      pending = lines.pop() ?? ''
+      if ([...lines, pending].some(line => line.includes(PORTAL_SIGNAL))) {
+        pending = ''
+        this.sync()
+      }
+    }, (recoverable) => {
       if (recoverable) this.poll()
       else this.watching = false
     })
