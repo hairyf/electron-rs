@@ -31,6 +31,10 @@ export const systemProcesses: ThemeProcesses = {
     child.stdout?.on('data', onData)
     child.once('error', () => onEnd(false))
     child.once('exit', () => onEnd(true))
+    // 这条订阅在进程存活期间一直不退出。unref 之后它不再撑住事件循环：Electron 主进程
+    // 本来就有自己的 handle，而测试里加载这份模块时不会因为一个常驻子进程卡住整轮退出
+    // （CI 上 runtime-modules 就是这么被拖到超时的）。
+    child.unref()
     return () => {
       child.stdout?.removeAllListeners()
       child.removeAllListeners()
