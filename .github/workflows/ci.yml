@@ -69,8 +69,50 @@ jobs:
           pnpm run build
           git diff --exit-code -- assets
 
+      # 逐条跑并打印结果：整串 && 串起来时，任何一条卡住都只会看到整步挂在那里，
+      # 分不清是哪一条（linux 上曾整轮卡到 job 超时）。timeout 让单条挂住也能定位，
+      # macOS 没有 GNU timeout，用 gtimeout 兜底、两者都没有就裸跑。
       - name: Test Node regressions
-        run: pnpm run test:checks
+        shell: bash
+        run: |
+          set -uo pipefail
+          limiter=()
+          command -v timeout >/dev/null 2>&1 && limiter=(timeout 120)
+          command -v gtimeout >/dev/null 2>&1 && limiter=(gtimeout 120)
+          status=0
+          while IFS= read -r check; do
+            [ -z "$check" ] && continue
+            echo "::group::check: $check"
+            start=$SECONDS
+            if ${limiter[@]+"${limiter[@]}"} $check; then
+              echo "::endgroup::"
+              echo "PASS (${check}) $((SECONDS - start))s"
+            else
+              code=$?
+              echo "::endgroup::"
+              echo "FAIL ($code) (${check}) $((SECONDS - start))s"
+              status=1
+            fi
+          done <<'CHECKS'
+          node --experimental-vm-modules tests/checks/launcher.mjs
+          node tests/checks/transport.mjs
+          node tests/checks/authenticated-host.mjs
+          node tests/checks/startup.mjs
+          node tests/checks/system-theme.mjs
+          node tests/fixtures/webview-layout.mjs app-menu
+          node tests/checks/commands.mjs
+          node tests/fixtures/webview-layout.mjs native-interaction
+          node tests/fixtures/webview-layout.mjs minimized-constraints
+          node tests/fixtures/webview-layout.mjs main-dpi
+          node tests/fixtures/webview-layout.mjs display-scale
+          node tests/fixtures/webview-layout.mjs guest-webview
+          node tests/fixtures/webview-layout.mjs app-command
+          node tests/fixtures/webview-policy.mjs guest
+          node tests/fixtures/webview-policy.mjs managed-guest
+          node tests/fixtures/webview-policy.mjs lifecycle
+          node tests/fixtures/webview-policy.mjs clipboard
+          CHECKS
+          exit "$status"
 
       - name: Install browser fixture Electron
         run: node node_modules/electron/install.js

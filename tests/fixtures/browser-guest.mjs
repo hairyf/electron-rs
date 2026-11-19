@@ -196,7 +196,10 @@ async function run() {
         caption.focus()
         caption.blur()
         caption.focus()
-        caption.setBounds({ width: 800, height: 540 })
+        // macOS 的 setBounds 走 NativeImage/Rect 转换，四个字段必须齐全，少 x/y 会抛
+        // "Error processing argument at index 0, conversion failure"。
+        const before = caption.getBounds()
+        caption.setBounds({ x: before.x, y: before.y, width: 800, height: 540 })
         const resized = caption.getBounds()
         assert.deepEqual([resized.width, resized.height, windows.get(6).configuration.trafficLightPosition], [800, 540, { x: 18, y: 24 }],
           'an inset macOS window must keep its frame and inset across key-state and resize layout passes')
