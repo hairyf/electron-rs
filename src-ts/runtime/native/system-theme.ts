@@ -63,12 +63,16 @@ export class SystemTheme {
   private stop?: () => void
   private timer?: NodeJS.Timeout
 
-  constructor(private readonly nativeTheme: NativeTheme, private readonly processes: ThemeProcesses = systemProcesses) {
-    this.preference = nativeTheme.themeSource as ThemePreference
+  /**
+   * `nativeTheme` 允许缺席：runtime-modules 之类的 fixture 用 mock 的 electron 加载这份产物，
+   * 那里没有 nativeTheme。缺席时整个类退化为空转——读不到来源也就不该去写主题源。
+   */
+  constructor(private readonly nativeTheme: NativeTheme | undefined, private readonly processes: ThemeProcesses = systemProcesses) {
+    this.preference = (nativeTheme?.themeSource ?? 'system') as ThemePreference
   }
 
   start(): void {
-    if (this.watching || this.disposed) return
+    if (this.watching || this.disposed || !this.nativeTheme) return
     this.watching = true
     this.sync()
     // 按行判断而不是整块 includes：chunk 边界可能把一个键名劈成两半，跨块匹配会漏。
@@ -151,7 +155,7 @@ export class SystemTheme {
   /// 写入前记住是我们自己写的值。外部（平台、测试、其它模块）改过的具体值不能被
   /// 「跟随系统但读不到来源」覆盖成 system，否则用户看到的主题会被无依据地顶掉。
   private write(target: ThemePreference): void {
-    if (this.nativeTheme.themeSource === target) return
+    if (!this.nativeTheme || this.nativeTheme.themeSource === target) return
     this.nativeTheme.themeSource = target
   }
 }

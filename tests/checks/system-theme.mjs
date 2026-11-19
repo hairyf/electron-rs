@@ -200,4 +200,18 @@ for (const [raw, expected] of [['v u 1\n', 'dark'], ['v u 2\n', 'light']]) {
   assert.deepEqual(theme.writes, ['dark'], 'a disposed watcher never writes again')
 }
 
+{
+  // runtime-modules 之类的 fixture 用 mock 的 electron 加载这份产物，那里没有 nativeTheme。
+  // 构造和 start 都必须安全空转，否则整个 runtime 模块在 CI 上起不来（#1577 排查时踩到）。
+  const bus = processes({ busctl: 'v u 1\n' })
+  const system = new SystemTheme(undefined, bus)
+  system.start()
+  system.set('dark')
+  system.set('system')
+  await sleep(5)
+  assert.deepEqual(bus.reads, [], 'a missing nativeTheme must not read or write anything')
+  assert.equal(bus.watchers.length, 0, 'a missing nativeTheme must not subscribe to the portal')
+  system.dispose()
+}
+
 console.log('system-theme: PASS')
