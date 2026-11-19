@@ -1,0 +1,171 @@
+import { execFile, spawn } from 'node:child_process'
+import type { NativeTheme } from 'electron'
+
+export type ThemePreference = 'system' | 'dark' | 'light'
+export type ColorScheme = 'dark' | 'light'
+
+export interface ThemeProcesses {
+  read(command: string, args: readonly string[]): Promise<string>
+  watch(command: string, args: readonly string[], onData: (chunk: string) => void, onEnd: (recoverable: boolean) => void): () => void
+}
+
+const POLL_INTERVAL_MS = 2_000
+const PORTAL_READ: string[] = ['--user', 'call', 'org.freedesktop.portal.Desktop', '/org/freedesktop/portal/desktop', 'org.freedesktop.portal.Settings', 'ReadOne', 'ss', 'org.freedesktop.appearance', 'color-scheme']
+// 只订阅 SettingChanged 信号，且不能带 SERVICE 位置参数：systemd 262 起 monitor 带位置参数时
+// 会忽略 --match、按 peer 全量订阅，于是 xdg-desktop-portal 上与主题无关的流量（KDE 下
+// ksystemstats 每 500ms 几十 KB 的传感器信号、其它应用对 portal 的调用）全被灌进主进程，
+// 空闲也要 ~2% CPU（issue #1577）。去掉位置参数后过滤在内核侧生效。
+const PORTAL_MONITOR: string[] = ['--user', '--match', `type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged'`, 'monitor']
+const PORTAL_SIGNAL = 'color-scheme'
+const SETTINGS_READ: string[] = ['get', 'org.gnome.desktop.interface', 'color-scheme']
+
+export const systemProcesses: ThemeProcesses = {
+  read(command, args) {
+    return new Promise((resolve, reject) => {
+      execFile(command, [...args], { timeout: 1_000, windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout))
+    })
+  },
+  watch(command, args, onData, onEnd) {
+    const child = spawn(command, [...args], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    child.stdout?.setEncoding('utf8')
+    child.stdout?.on('data', onData)
+    child.once('error', () => onEnd(false))
+    child.once('exit', () => onEnd(true))
+    // 这条订阅在进程存活期间一直不退出。unref 之后它不再撑住事件循环：Electron 主进程
+    // 本来就有自己的 handle，而测试里加载这份模块时不会因为一个常驻子进程卡住整轮退出
+    // （CI 上 runtime-modules 就是这么被拖到超时的）。
+    child.unref()
+    return () => {
+      child.stdout?.removeAllListeners()
+      child.removeAllListeners()
+      child.kill()
+    }
+  },
+}
+
+export function portalScheme(output: string): ColorScheme | null {
+  const value = Number(/(\d+)\s*$/.exec(output)?.[1])
+  return value === 1 ? 'dark' : value === 2 ? 'light' : null
+}
+
+export function settingsScheme(output: string): ColorScheme | null {
+  const value = output.trim().replace(/['"]/g, '')
+  return value === 'prefer-dark' ? 'dark' : value === 'prefer-light' ? 'light' : null
+}
+
+/**
+ * 主题源唯一写入点。Linux 上 Chromium 既不跟 org.freedesktop.portal.Settings 的
+ * color-scheme，也不跟 gsettings，GTK_THEME=Adwaita:dark 之类的环境变量还会把它钉死，
+ * 所以主进程自己读门户、自己写 nativeTheme.themeSource（issue #1509）。
+ */
+export class SystemTheme {
+  private preference: ThemePreference
+  private watching = false
+  private disposed = false
+  private reading = false
+  private rerun = false
+  private stop?: () => void
+  private timer?: NodeJS.Timeout
+
+  /**
+   * `nativeTheme` 允许缺席，也允许是个空壳：runtime-modules / startup 这类 fixture 用 mock 的
+   * electron 加载这份产物，那里没有真正的 nativeTheme。判据取 `themeSource` 是否存在——
+   * 没有它就没有可写的主题源，整类退化为空转，既不读也不订阅。
+   */
+  constructor(private readonly nativeTheme: NativeTheme | undefined, private readonly processes: ThemeProcesses = systemProcesses) {
+    this.preference = (nativeTheme?.themeSource ?? 'system') as ThemePreference
+  }
+
+  start(): void {
+    if (this.watching || this.disposed || !this.followable) return
+    this.watching = true
+    this.sync()
+    // 按行判断而不是整块 includes：chunk 边界可能把一个键名劈成两半，跨块匹配会漏。
+    // 命中的那一行消费掉，未命中的残行留到下一块继续拼，避免同一条记录被反复计入。
+    let pending = ''
+    this.stop = this.processes.watch('busctl', PORTAL_MONITOR, (chunk) => {
+      pending += chunk
+      const lines = pending.split('\n')
+      pending = lines.pop() ?? ''
+      if ([...lines, pending].some(line => line.includes(PORTAL_SIGNAL))) {
+        pending = ''
+        this.sync()
+      }
+    }, (recoverable) => {
+      if (recoverable) this.poll()
+      else this.watching = false
+    })
+  }
+
+  set(preference: ThemePreference): void {
+    this.preference = preference
+    if (preference !== 'system') {
+      this.write(preference)
+      return
+    }
+    // 用户显式选跟随系统：能读到来源就写来源；读不到时交回平台一次，由 Electron 自己
+    // 决定，之后不再插手（既不留中间闪烁，也不反复改写）。
+    if (!this.watching)
+      this.write('system')
+    else
+      this.sync()
+  }
+
+  dispose(): void {
+    this.disposed = true
+    if (this.timer) {
+      clearTimeout(this.timer)
+      this.timer = undefined
+    }
+    this.stop?.()
+    this.stop = undefined
+  }
+
+  private sync(): void {
+    if (this.disposed || this.preference !== 'system') return
+    if (this.reading) {
+      this.rerun = true
+      return
+    }
+    this.reading = true
+    void this.processes.read('busctl', PORTAL_READ)
+      .then(portalScheme, () => null)
+      .then(scheme => scheme ?? this.processes.read('gsettings', SETTINGS_READ).then(settingsScheme, () => null))
+      .then((scheme) => {
+        this.reading = false
+        // 读不到来源时保持原值：CI 与非 GNOME 桌面上 portal/gsettings 都可能是空的，
+        // 此时写 system 会把平台或测试已经设好的真实值覆盖掉。
+        // 只写真正读到的来源。读不到一律不动 themeSource：Linux 上 Electron 自己的系统
+        // 跟随本就是坏的（issue #1509 的起因），我们主动写 system 既救不回主题，还会把
+        // 别人（平台或测试）已经设好的值覆盖掉。
+        if (!this.disposed && this.preference === 'system' && scheme !== null)
+          this.write(scheme)
+        if (this.rerun) {
+          this.rerun = false
+          this.sync()
+        }
+      })
+  }
+
+  private poll(): void {
+    if (this.disposed || this.timer) return
+    this.timer = setTimeout(() => {
+      this.timer = undefined
+      this.sync()
+      this.poll()
+    }, POLL_INTERVAL_MS)
+    this.timer.unref()
+  }
+
+  /// 写入前记住是我们自己写的值。外部（平台、测试、其它模块）改过的具体值不能被
+  /// 「跟随系统但读不到来源」覆盖成 system，否则用户看到的主题会被无依据地顶掉。
+  private write(target: ThemePreference): void {
+    if (!this.followable || this.nativeTheme!.themeSource === target) return
+    this.nativeTheme!.themeSource = target
+  }
+
+  /** 有真正可读写的主题源才跟随；空壳 nativeTheme 只出现在测试 fixture 里。 */
+  private get followable(): boolean {
+    return typeof this.nativeTheme?.themeSource === 'string'
+  }
+}
