@@ -214,4 +214,18 @@ for (const [raw, expected] of [['v u 1\n', 'dark'], ['v u 2\n', 'light']]) {
   system.dispose()
 }
 
+{
+  // runtime-modules / startup 的 mock 给的是空壳 nativeTheme（没有 themeSource）。
+  // 这种情况必须同样空转：曾经只判断对象存在，于是 linux 上真的 spawn 了 busctl，
+  // 子进程不退出，startup.mjs 打完 PASS 后一直挂着（CI 上卡到超时）。
+  const bus = processes({ busctl: 'v u 1\n' })
+  const system = new SystemTheme({}, bus)
+  system.start()
+  system.set('dark')
+  await sleep(5)
+  assert.deepEqual(bus.reads, [], 'an empty nativeTheme stub must not read anything')
+  assert.equal(bus.watchers.length, 0, 'an empty nativeTheme stub must not subscribe to the portal')
+  system.dispose()
+}
+
 console.log('system-theme: PASS')

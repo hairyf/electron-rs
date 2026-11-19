@@ -68,15 +68,16 @@ export class SystemTheme {
   private timer?: NodeJS.Timeout
 
   /**
-   * `nativeTheme` 允许缺席：runtime-modules 之类的 fixture 用 mock 的 electron 加载这份产物，
-   * 那里没有 nativeTheme。缺席时整个类退化为空转——读不到来源也就不该去写主题源。
+   * `nativeTheme` 允许缺席，也允许是个空壳：runtime-modules / startup 这类 fixture 用 mock 的
+   * electron 加载这份产物，那里没有真正的 nativeTheme。判据取 `themeSource` 是否存在——
+   * 没有它就没有可写的主题源，整类退化为空转，既不读也不订阅。
    */
   constructor(private readonly nativeTheme: NativeTheme | undefined, private readonly processes: ThemeProcesses = systemProcesses) {
     this.preference = (nativeTheme?.themeSource ?? 'system') as ThemePreference
   }
 
   start(): void {
-    if (this.watching || this.disposed || !this.nativeTheme) return
+    if (this.watching || this.disposed || !this.followable) return
     this.watching = true
     this.sync()
     // 按行判断而不是整块 includes：chunk 边界可能把一个键名劈成两半，跨块匹配会漏。
@@ -159,7 +160,12 @@ export class SystemTheme {
   /// 写入前记住是我们自己写的值。外部（平台、测试、其它模块）改过的具体值不能被
   /// 「跟随系统但读不到来源」覆盖成 system，否则用户看到的主题会被无依据地顶掉。
   private write(target: ThemePreference): void {
-    if (!this.nativeTheme || this.nativeTheme.themeSource === target) return
-    this.nativeTheme.themeSource = target
+    if (!this.followable || this.nativeTheme!.themeSource === target) return
+    this.nativeTheme!.themeSource = target
+  }
+
+  /** 有真正可读写的主题源才跟随；空壳 nativeTheme 只出现在测试 fixture 里。 */
+  private get followable(): boolean {
+    return typeof this.nativeTheme?.themeSource === 'string'
   }
 }
