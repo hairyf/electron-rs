@@ -207,7 +207,21 @@ function appCommands(ctx: CommandContext): CommandTable {
       ctx.applyTheme(p.theme === 'dark' ? 'dark' : p.theme === 'light' ? 'light' : 'system')
       return null
     },
+    'app.exit': (p) => {
+      // `app.exit` skips `before-quit` handlers on purpose: the host already
+      // decided, so nothing may veto it a second time.
+      setImmediate(() => ctx.app.exit(Number(p.code) || 0))
+      return null
+    },
+    'app.exitResponse': (p) => {
+      ctx.policies.answerExit(p.decision === 'allow')
+      return null
+    },
+    'app.configure': (p) => {
+      ctx.policies.configure(p)
+      return null
+    },
     'shell.openExternal': (p) => shell.openExternal(String(p.url)).then(() => null),
-    'shell.openPath': (p) => shell.openPath(String(p.path)).then(() => null),
+    'shell.openPath': (p) => shell.openPath(String(p.path)).then((error) => error || null),
   }
 }

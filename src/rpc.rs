@@ -201,6 +201,8 @@ pub mod window {
     Normal,
     Paused,
     Error,
+    /// A bar with no known progress, which Electron draws as an activity indicator.
+    Indeterminate,
   }
 
   #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,7 +431,8 @@ pub mod window {
     SetShadow { window_id: u32, value: bool } => (), "window.shadow";
     SetDecorations { window_id: u32, value: bool } => (), "window.decorations";
     /// This updates the application badge, despite the legacy window namespace.
-    SetBadgeCount { count: u32 } => (), "window.badgeCount";
+    /// `None` clears the badge, which Electron spells as a count of zero.
+    SetBadgeCount { count: Option<u32> } => (), "window.badgeCount";
     SetOverlayIcon { window_id: u32, icon: Option<Icon>, description: String } => (), "window.overlayIcon";
     SetBackgroundColor { window_id: u32, color: Option<Color> } => (), "window.backgroundColor";
     SetBackgroundMaterial { window_id: u32, material: BackgroundMaterial } => (), "window.backgroundMaterial";
@@ -724,6 +727,46 @@ pub mod app {
     Prohibited,
   }
 
+  /// The answer to a native exit request, which Electron holds while the socket
+  /// is open so the host decides whether the application really quits.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+  #[serde(rename_all = "camelCase")]
+  pub enum ExitDecision {
+    /// Let the application quit.
+    Allow,
+    /// Keep running.
+    Cancel,
+  }
+
+  /// One Chromium profile preference, applied before the first session is used.
+  #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+  #[serde(rename_all = "camelCase")]
+  pub struct Preference {
+    pub name: String,
+    pub value: Value,
+  }
+
+  /// The default answer for one permission category, for every origin.
+  #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+  #[serde(rename_all = "camelCase")]
+  pub struct ContentSetting {
+    /// The Electron permission name, e.g. `geolocation`.
+    pub permission: String,
+    /// `Some(true)` allows, `Some(false)` blocks, `None` defers to the
+    /// application's permission handler.
+    pub answer: Option<bool>,
+  }
+
+  /// How a TLS certificate error is answered.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+  #[serde(rename_all = "lowercase")]
+  pub enum CertificateErrorPolicy {
+    /// Show Chromium's SSL interstitial, which offers a way through.
+    Interstitial,
+    /// Cancel the request.
+    Cancel,
+  }
+
   requests! {
     SetMenu { menu: Option<Vec<window::MenuItem>> } => (), "app.setMenu", deferred = true;
     SetBadgeLabel { label: String } => (), "app.badgeLabel", deferred = true;
@@ -733,11 +776,41 @@ pub mod app {
     SetActivationPolicy { policy: ActivationPolicy } => (), "app.activationPolicy", deferred = true;
     SetDockVisibility { visible: bool } => (), "app.dockVisibility", deferred = true;
     SetTheme { theme: Theme } => (), "app.theme", deferred = true;
+    /// Quits with `code`, which becomes the Electron process exit status.
+    Exit { code: i32 } => (), "app.exit", deferred = true;
+    /// Answers a pending `app.exitRequested`; `Allow` lets the application quit.
+    ExitResponse { decision: ExitDecision } => (), "app.exitResponse", deferred = true;
+    /// Applies the runtime-wide Chromium policy before the first session is used.
+    ///
+    /// Everything here has to be in place before a window exists, so it travels as
+    /// one request instead of one call per preference.
+    Configure {
+      preferences: Vec<Preference>,
+      global_preferences: Vec<Preference>,
+      content_settings: Vec<ContentSetting>,
+      certificate_errors: CertificateErrorPolicy,
+      devtools_allowed: bool,
+      /// The Chromium user-data directory, when the runtime overrides it.
+      cache_path: Option<String>,
+      /// The `Accept-Language` list, when the runtime overrides it.
+      accept_language_list: Option<String>,
+      /// The whole User-Agent string, when the runtime sets one.
+      user_agent: Option<String>,
+      /// The product token spliced into Chromium's own User-Agent.
+      user_agent_product: Option<String>,
+      /// Whether session cookies survive a restart.
+      persist_session_cookies: bool,
+      /// Whether the spell checker runs, `None` leaves Chromium's default.
+      spell_checking: Option<bool>,
+      /// Whether Safe Browsing runs, `None` leaves Chromium's default.
+      safe_browsing: Option<bool>,
+    } => (), "app.configure", deferred = true;
     /// Hands an absolute URL or path to the operating system the way a user's
     /// double click does, from the Electron main process: the shell owns the
     /// activation of whatever application claims the target.
     OpenExternal { url: String } => (), "shell.openExternal", deferred = true;
-    OpenPath { path: String } => String, "shell.openPath", deferred = true;
+    /// `Ok` carries the shell's error text, which is empty when the target opened.
+    OpenPath { path: String } => Option<String>, "shell.openPath", deferred = true;
   }
 }
 

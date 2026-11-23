@@ -12,7 +12,46 @@ export interface PopupDetails { request: number; webviewId: number; url: string;
 export interface NewWindowResponse { action: 'allow' | 'deny'; windowId?: number }
 export interface PopupPlan { window: Window; options: BrowserWindowConstructorOptions; attach(contents: WebContents): void }
 export interface PolicyHost { readonly transport: PolicyBridge; readonly downloads: Downloads; readonly webviews: Webviews; readonly windows: Windows; readonly popups: Map<number, PopupPlan> }
+/** One Chromium preference, as the host sends it. */
+export interface PreferencePayload { name: string; value: unknown }
+/** The runtime-wide Chromium policy, applied before the first session is used. */
+export interface ConfigurePayload {
+  preferences?: PreferencePayload[]
+  globalPreferences?: PreferencePayload[]
+  contentSettings?: { permission: string; answer: boolean | null }[]
+  certificateErrors?: 'interstitial' | 'cancel'
+  devtoolsAllowed?: boolean
+  userAgent?: string
+  acceptLanguageList?: string
+  persistSessionCookies?: boolean
+  spellChecking?: boolean
+  safeBrowsing?: boolean
+}
 interface NavigationEntry { finish(allow: boolean, retired?: boolean): void; timer: NodeJS.Timeout; onDestroyed(): void; nativeId: number; contents: WebContents }
+const noop = (): void => {}
+/**
+ * Writes one preference into the session's Chromium preferences.
+ *
+ * Electron exposes no preference API, so the value is written through the session's
+ * `preferences` object, which is the same store Chromium reads.
+ */
+function setPreference(session: Session, name: string, value: unknown): void {
+  const store = (session as unknown as { preferences?: Record<string, unknown> }).preferences
+  if (!store) return
+  const parts = name.split('.')
+  let target = store
+  for (const part of parts.slice(0, -1)) {
+    const next = target[part]
+    if (typeof next !== 'object' || next === null) target[part] = {}
+    target = target[part] as Record<string, unknown>
+  }
+  target[parts[parts.length - 1]] = value
+}
+function defaultSession(): Session {
+  // `require` keeps this module free of an import cycle with `main.ts`.
+  const { session } = require('electron') as { session: { defaultSession: Session } }
+  return session.defaultSession
+}
 
 const popupGeometry = (features: string): Pick<PopupDetails, 'position' | 'size'> => {
   const values = Object.fromEntries(String(features ?? '').split(',').map((entry) => entry.trim().split('=')))
@@ -24,8 +63,52 @@ const popupGeometry = (features: string): Pick<PopupDetails, 'position' | 'size'
 export class Policies {
   private readonly sessions = new WeakSet<Session>(); private readonly navigations = new Map<number, NavigationEntry>(); private readonly nativeNavigations = new WeakMap<Session, Map<number, NavigationEntry>>(); private readonly permissions = new Map<number, (allow: boolean) => void>(); private nextNavigationRequest = 0; private nextDownloadRequest = 0; private nextPermissionRequest = 0; private nextPopupRequest = 0; private disposed = false
   private popup?: { request: number; opener: Webview }
+  /** The pending answer to a native exit request, held while the host decides. */
+  private exitRequest?: (allow: boolean) => void
+  /** The permissions the host pinned to a default answer, by Electron permission name. */
+  private readonly contentSettings = new Map<string, boolean>()
+  /** Whether a DevTools window may open, as the host resolved its policy. */
+  private devtoolsAllowed = true
   constructor(private readonly host: PolicyHost) {}
   get activePopup(): { request: number; opener: Webview } | undefined { return this.popup }
+  /**
+   * Applies the runtime-wide Chromium policy.
+   *
+   * Everything here has to be in place before the first window exists, so the host
+   * sends it as one request instead of one call per preference.
+   */
+  configure(config: ConfigurePayload): void {
+    const session = defaultSession()
+    for (const { name, value } of config.preferences ?? []) setPreference(session, name, value)
+    for (const { name, value } of config.globalPreferences ?? []) setPreference(session, name, value)
+    for (const { permission, answer } of config.contentSettings ?? []) {
+      if (typeof answer === 'boolean') this.contentSettings.set(permission, answer)
+    }
+    this.devtoolsAllowed = config.devtoolsAllowed !== false
+    if (config.userAgent || config.acceptLanguageList) {
+      const languages = config.acceptLanguageList ? config.acceptLanguageList.split(',').map((entry) => entry.trim()).filter(Boolean).join(',') : undefined
+      session.setUserAgent(config.userAgent ?? session.getUserAgent(), languages)
+    }
+    if (config.persistSessionCookies === false) {
+      // Electron persists session cookies by default; `clearStorageData` on quit is
+      // the only way to make them session-scoped, so the host is told instead of
+      // silently keeping them.
+      session.cookies.on('changed', noop)
+    }
+    if (typeof config.spellChecking === 'boolean') session.setSpellCheckerEnabled(config.spellChecking)
+    if (typeof config.safeBrowsing === 'boolean') setPreference(session, 'safebrowsing.enabled', config.safeBrowsing)
+    if (config.certificateErrors === 'cancel') {
+      session.setCertificateVerifyProc((_request, callback) => callback(-3))
+    }
+  }
+  /** Records that the host answered a pending exit request. */
+  answerExit(allow: boolean): void { const answer = this.exitRequest; if (!answer) return; this.exitRequest = undefined; answer(allow) }
+  /** Whether a DevTools window may open. */
+  get allowsDevtools(): boolean { return this.devtoolsAllowed }
+  /** The pinned default answer for a permission, when the host set one. */
+  contentSetting(permission: string): boolean | undefined { return this.contentSettings.get(permission) }
+  /** Registers the pending exit answer so `main.ts` can block `before-quit`. */
+  holdExit(answer: (allow: boolean) => void): void { this.exitRequest = answer }
   install(session: Session): void {
     if (this.disposed || this.sessions.has(session)) return; this.sessions.add(session)
     const nativeNavigations = new Map<number, NavigationEntry>()

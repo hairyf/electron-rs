@@ -196,6 +196,10 @@ app.on('before-quit', (event) => {
   if (transport.closed) return
   event.preventDefault()
   transport.send('app.exitRequested', {})
+  // One answer per request: a second `before-quit` while one is pending replaces it.
+  policies.holdExit((allow) => {
+    if (allow) app.quit()
+  })
 })
 
 // macOS dock 激活：转给 Rust，由它决定是否建窗。
