@@ -31,7 +31,11 @@ import type { WebContents } from 'electron'
 
 const appName = process.env.ELECTRON_RS_APP_NAME
 if (appName) app.setName(appName)
-const owner = process.env.TAURI_RUNTIME_ELECTRON_OWNER
+// An explicit `--user-data-dir` is the host's decision and outranks the owner
+// derivation: a runtime that names its own profile directory must get that one,
+// not a directory named after whatever executable happens to be running.
+const explicitUserData = process.argv.some((entry) => entry === '--user-data-dir' || entry.startsWith('--user-data-dir='))
+const owner = explicitUserData ? undefined : process.env.TAURI_RUNTIME_ELECTRON_OWNER
 if (owner) {
   const directory = path.join(app.getPath('appData'), owner)
   fs.mkdirSync(directory, { recursive: true })

@@ -278,7 +278,13 @@ fn resolve_output(
     let out = absolute_path(out, current_dir)?;
     let package = out.parent().filter(|_| out.file_name().is_some_and(|name| name == "out"))
       .ok_or("unexpected Cargo OUT_DIR layout: expected <target>/<profile>/build/<package>/out")?;
-    let build = package.parent().filter(|build| build.file_name().is_some_and(|name| name == "build"))
+    // Cargo has two build-directory layouts: `<build>/<package>-<hash>/out` and,
+    // since the build-dir rework, `<build>/<package>/<hash>/out`. Accept both, so
+    // the same crate works on an older and a newer toolchain.
+    let build = package.parent()
+      .filter(|parent| parent.file_name().is_some_and(|name| name == "build"))
+      .or_else(|| package.parent()?.parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "build")))
       .ok_or("unexpected Cargo OUT_DIR layout: missing build directory")?;
     let profile = build.parent().ok_or("Cargo OUT_DIR has no profile directory")?;
     let mut root = profile.parent().ok_or("Cargo profile has no target directory")?;
