@@ -331,7 +331,23 @@ export class Window extends EventEmitter<WindowEvents> {
   hide(): void { this.native.hide() }
   focus(): void { if (this.env.platform === 'darwin') this.env.app.focus({ steal: true }); this.native.focus() }
   close(): void { this.native.close() }
-  setAlwaysOnTop(value: boolean): void { this.native.setAlwaysOnTop(value) }
+  /**
+   * Applies the topmost flag, forcing the change when Electron would ignore it.
+   *
+   * `BaseWindow.setAlwaysOnTop` returns early when the requested z-order matches
+   * the one Electron recorded at creation, and a window created with
+   * `alwaysOnTop: false` and mapped later keeps that record even though the native
+   * window is not topmost — so a single `setAlwaysOnTop(true)` after the window is
+   * shown is a silent no-op on Windows. Clearing the flag first makes the second
+   * call a real change, which is what the caller asked for.
+   */
+  setAlwaysOnTop(value: boolean): void {
+    if (this.native.isAlwaysOnTop() === value) return
+    this.native.setAlwaysOnTop(value)
+    if (this.native.isAlwaysOnTop() === value) return
+    this.native.setAlwaysOnTop(!value)
+    this.native.setAlwaysOnTop(value)
+  }
   setSkipTaskbar(value: boolean): void { this.native.setSkipTaskbar(value) }
   setFocusable(value: boolean): void { this.native.setFocusable(value) }
   setContentProtection(value: boolean): void { this.native.setContentProtection(value) }
